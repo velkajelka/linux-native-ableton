@@ -42,14 +42,14 @@ You do not need to install `innoextract`. The installer brings its own (see [inn
 2. Clone this repository into a folder.
 
    ```sh
-   git clone https://github.com/velkajelka/ableton-linux.git
+   git clone https://github.com/velkajelka/linux-native-ableton.git
    cd ableton-linux
    ```
 
    Or without git:
 
    ```sh
-   curl -L -o ableton-linux.zip https://github.com/velkajelka/ableton-linux/archive/refs/heads/main.zip
+   curl -L -o ableton-linux.zip https://github.com/velkajelka/linux-native-ableton/archive/refs/heads/main.zip
    unzip ableton-linux.zip
    cd ableton-linux-main
    ```
