@@ -43,15 +43,15 @@ You do not need to install `innoextract`. The installer brings its own (see [inn
 
    ```sh
    git clone https://github.com/velkajelka/linux-native-ableton.git
-   cd ableton-linux
+   cd linux-native-ableton
    ```
 
    Or without git:
 
    ```sh
-   curl -L -o ableton-linux.zip https://github.com/velkajelka/linux-native-ableton/archive/refs/heads/main.zip
-   unzip ableton-linux.zip
-   cd ableton-linux-main
+   curl -L -o linux-native-ableton.zip https://github.com/velkajelka/linux-native-ableton/archive/refs/heads/main.zip
+   unzip linux-native-ableton.zip
+   cd linux-native-ableton-main
    ```
 3. You need your own copies of:
 
