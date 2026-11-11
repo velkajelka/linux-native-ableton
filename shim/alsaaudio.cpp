@@ -25,6 +25,14 @@
 // converted 128 channels every cycle. The count is capped at the channels of
 // the hw device Live chose (opened briefly, or read from /proc/asound while
 // PipeWire holds it; 2 when neither works). LIVE_ALSA_CHANNELS=<n> sets the cap.
+//
+// The audio worker threads (the "AudioCalc" threads Live's engine fills its
+// work group with) are sized from the ONLINE cpu count: 15 of them on this
+// 16-core machine, and still 15 with the process pinned to 8 cores, so the
+// count comes from sysconf (_SC_NPROCESSORS_ONLN), not from the affinity
+// mask. LIVE_AUDIO_THREADS=<n> caps what Live's own calls see — fewer audio
+// worker threads, while nothing is pinned and every thread still runs on
+// every core. Calls from Live's libraries pass through untouched.
 #include <alsa/asoundlib.h>
 #include <dlfcn.h>
 #include <link.h>
@@ -247,4 +255,21 @@ extern "C" int snd_pcm_hw_params_set_buffer_size(snd_pcm_t *pcm, snd_pcm_hw_para
         }
     }
     return real(pcm, params, val);
+}
+
+// The audio worker pool's size comes from the online cpu count; only Live's
+// own queries are capped, everything else (Qt, plug-ins, libc internals) sees
+// the machine as it is.
+extern "C" long sysconf(int name)
+{
+    static auto real = reinterpret_cast<long (*)(int)>(nextSymbol("sysconf", "GLIBC_2.2.5"));
+    long result = real(name);
+    if ((name == _SC_NPROCESSORS_ONLN || name == _SC_NPROCESSORS_CONF) && calledFromLive(__builtin_return_address(0))) {
+        if (const char *capped = getenv("LIVE_AUDIO_THREADS")) {
+            const long cap = strtol(capped, nullptr, 10);
+            if (cap > 0 && result > cap)
+                result = cap;
+        }
+    }
+    return result;
 }

@@ -3,7 +3,8 @@
    QWidget::resize (window.cpp), QWidget::update(QRect) (glsurface.cpp), QDrag::exec (dragcursor.cpp), snd_seq_event_input (alsamidi.cpp),
    snd_pcm_open, snd_pcm_hw_params_set_format_mask, snd_pcm_hw_params_set_channels
    and snd_pcm_hw_params_set_buffer_size (alsaaudio.cpp), the card scan
-   functions, stat and stat64 (pwdevices.cpp), execv, execve, system, posix_spawn and posix_spawnp (standalone.cpp). */
+   functions, sysconf for the audio worker count (alsaaudio.cpp), stat and
+   stat64 (pwdevices.cpp), execv, execve, system, posix_spawn and posix_spawnp (standalone.cpp). */
 Qt_5 {
     global: _ZN7QWidget6resizeERK5QSize; _ZN7QWidget6updateERK5QRect; _ZN5QDrag4execE6QFlagsIN2Qt10DropActionEE;
 };
@@ -17,7 +18,7 @@ GLIBC_2.33 {
     global: stat; stat64;
 };
 GLIBC_2.2.5 {
-    global: execv; execve; system;
+    global: execv; execve; system; sysconf;
 };
 GLIBC_2.15 {
     global: posix_spawn; posix_spawnp;

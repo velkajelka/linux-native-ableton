@@ -137,6 +137,7 @@ The audio path has settings, all optional:
 | `LIVE_ALSA_CHANNELS=n` | Cap the channel count Live opens (default: the device's own) |
 | `LIVE_ALSA_PERIODS=n` | Periods in the ring (default 2; 3 is Live's own) |
 | `LIVE_ALSA_MINRING=n` | The smallest ring, in frames (default: PipeWire's quantum; 0 disables) |
+| `LIVE_AUDIO_THREADS=n` | Cap the audio worker threads Live creates (Live sizes them from the cpu count: 15 on a 16-core machine). Nothing is pinned — the threads still run on every core |
 
 <br>
 
