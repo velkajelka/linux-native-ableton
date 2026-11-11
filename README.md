@@ -121,6 +121,25 @@ Because the companion owns the hardware directly, Push devices do **not** appear
 
 <br>
 
+## Audio and PipeWire
+
+Live talks ALSA, and the shim sends its hardware accesses to PipeWire: Live's device menu lists PipeWire's outputs and inputs (card 100 is "System Default", which follows the desktop's choice), samples leave in floating point instead of being cut to 16 bits, and the sound shares the sound card with the desktop through `pipewire-alsa`.
+
+PipeWire's graph cycles at its *quantum* (512 frames at 48 kHz on many systems; `pw-metadata -n settings` shows yours). The plugin feeds its stream out of Live's ALSA ring, and a ring shorter than a cycle drains before the next cycle refills it: every cycle then ends in an XRUN, hundreds per second, and the sound crackles or stays silent. Live's fresh-install default (three periods of 128 frames) is smaller than one cycle on such systems, so the shim lifts the ring to cover the quantum — Live's own buffer setting from that point on is respected as long as it stays above it.
+
+The audio path has settings, all optional:
+
+| Setting | Meaning |
+|---|---|
+| `LIVE_ALSA_DEVICE=pcm` | The ALSA PCM Live's hardware opens go to (`pipewire` by default; `hw:...` for the raw card) |
+| `LIVE_ALSA_EXCLUSIVE=1` | Direct hardware access, Live owns the card (as on the Push) |
+| `LIVE_ALSA_FORMAT=device` | Leave the sample format to ALSA (default: the best of float/S32/S24) |
+| `LIVE_ALSA_CHANNELS=n` | Cap the channel count Live opens (default: the device's own) |
+| `LIVE_ALSA_PERIODS=n` | Periods in the ring (default 2; 3 is Live's own) |
+| `LIVE_ALSA_MINRING=n` | The smallest ring, in frames (default: PipeWire's quantum; 0 disables) |
+
+<br>
+
 ## Where Live keeps its files
 
 Live behaves like any Linux program and uses your home folder, the same places it uses on Windows and macOS:
@@ -146,6 +165,7 @@ Live finds plug-ins in the usual folders (`~/.vst3`, `/usr/lib/vst3`, `/usr/loca
 | `xdg-mime: ... qtpaths: command not found` in the terminal (Fedora) | Harmless. |
 | Saving and exporting are deactivated | Live is not authorized yet. Authorize it with your Ableton account. |
 | Push 2 or Push 3 stays dark or its LEDs keep flashing | Live's companion cannot open the USB device. Give the user read/write access to Ableton's USB devices (matches Push 2 and Push 3): `echo 'SUBSYSTEM=="usb",ATTR{idVendor}=="2982",MODE="0660",GROUP="audio"' \| sudo tee /etc/udev/rules.d/99-ableton-push.rules && sudo udevadm control --reload && sudo udevadm trigger`, then replug the hardware and restart Live. You must be in the `audio` group. |
+| Audio crackles, and Live's log fills with `State=XRUN` | Live's ring is shorter than one PipeWire cycle. The shim lifts it to cover the quantum automatically; if your quantum is unusual (above 1024 frames), either raise Live's buffer to match (`pw-metadata -n settings` shows the quantum) or set `LIVE_ALSA_MINRING` (see [Audio and PipeWire](#audio-and-pipewire)). |
 
 <br>
 
