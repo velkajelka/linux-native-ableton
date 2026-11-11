@@ -54,6 +54,7 @@
 // window, then onSize. A plug-in that cannot resize gets its own size back.
 // Addresses are for Live 12.4.7 (Push 3 2.4.7); the hook is skipped if the
 // thunk does not hold the expected bytes.
+#include <QApplication>
 #include <QHash>
 #include <QTimer>
 #include <X11/Xlib.h>
@@ -336,6 +337,23 @@ void fitToView(Display *dpy, Window w)
 extern "C" int XMoveResizeWindow(Display *dpy, Window w, int x, int y, unsigned width, unsigned height)
 {
     static auto real = next<decltype(&XMoveResizeWindow)>("XMoveResizeWindow");
+    // Max for Live device windows. The Max runtime creates them as native X
+    // children of Live's window (juce::Desktop::setGlobalScaleFactor and
+    // jmonitor_getdisplayscalefactor live in libMaxPlugLib.so). Live hands
+    // their rectangle over in its own units (zoom x scale, the units the rest
+    // of its views use), but an X window needs pixels: unscaled, every Max
+    // device sat above and left of its slot by (ratio - 1) times its position.
+    // The window's size is scaled for the same reason; the Max view inside
+    // keeps its own scale, so it draws smaller than the frame until the
+    // runtime's scale follows Live's (see FINDINGS.md).
+    if (!windowProps.contains(w) && height >= 100) {
+        if (const qreal ratio = qApp ? qApp->devicePixelRatio() : 1.0; ratio != 1.0) {
+            x = qRound(x * ratio);
+            y = qRound(y * ratio);
+            width = unsigned(qRound(width * ratio));
+            height = unsigned(qRound(height * ratio));
+        }
+    }
     if (!windowProps.contains(w))
         return real(dpy, w, x, y, width, height);
     fitSizeHints(dpy, w, width, height);
