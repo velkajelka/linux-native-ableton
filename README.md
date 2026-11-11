@@ -109,7 +109,15 @@ It asks whether to delete Live's settings and licence too (default: keep them). 
 
 While this appears like a fully functional build, it does not include some of the features the Windows build has, such as:
 
-REX loops, VST2 (VST3 works), EXS24/SoundFont/Kontakt import, web views, video export, Push 2 display, Pack downloads, screen-reader support, and media keys.
+REX loops, VST2 (VST3 works), EXS24/SoundFont/Kontakt import, web views, video export, Pack downloads, screen-reader support, and media keys.
+
+<br>
+
+## Push hardware
+
+Push 2 and Push 3 are supported. When Push hardware is connected, Live starts its companion program (`Push3`, from the Push 3 image) by itself; the companion drives the pads, the LED matrix and the display over USB. Leave the control-surface slots in Live's MIDI preferences at "None" — none of them is needed.
+
+Because the companion owns the hardware directly, Push devices do **not** appear in Live's MIDI preferences. In particular, do not select the "Push2" control surface: it is the legacy path of the desktop builds, and its display process does not exist in this build — selecting it stalls Live for a moment and the hardware stays dark.
 
 <br>
 
@@ -137,6 +145,7 @@ Live finds plug-ins in the usual folders (`~/.vst3`, `/usr/lib/vst3`, `/usr/loca
 | `innoextract` errors such as "Unexpected setup data version: 6.4.0.1" | Your system's innoextract is 1.9 or older. The installer uses its bundled copy first; check `install.log` for its messages. |
 | `xdg-mime: ... qtpaths: command not found` in the terminal (Fedora) | Harmless. |
 | Saving and exporting are deactivated | Live is not authorized yet. Authorize it with your Ableton account. |
+| Push 2 or Push 3 stays dark or its LEDs keep flashing | Live's companion cannot open the USB device. Give the user read/write access to Ableton's USB devices (matches Push 2 and Push 3): `echo 'SUBSYSTEM=="usb",ATTR{idVendor}=="2982",MODE="0660",GROUP="audio"' \| sudo tee /etc/udev/rules.d/99-ableton-push.rules && sudo udevadm control --reload && sudo udevadm trigger`, then replug the hardware and restart Live. You must be in the `audio` group. |
 
 <br>
 
