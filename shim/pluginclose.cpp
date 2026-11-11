@@ -56,6 +56,7 @@
 // thunk does not hold the expected bytes.
 #include <QApplication>
 #include <QHash>
+#include <QSet>
 #include <QTimer>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -104,6 +105,15 @@ using pluginview::ViewRect;
 using pluginview::kResultTrue;
 
 namespace {
+
+// Max for Live device views: the native X children of Live's window that the
+// shim repositions. They have to disappear when the device view is not shown
+// (Clip view) - Live itself never hides them for that case, but it does hide
+// them when a track's devices change, so unmapping is a state it handles.
+QSet<Window> maxDeviceViews;
+bool maxDeviceViewsHidden;
+
+
 
 using ObserverFn = void (*)(void *controller, void *prop, int changeType);
 using SetBoolFn = void (*)(void *prop, bool value);
@@ -347,6 +357,7 @@ extern "C" int XMoveResizeWindow(Display *dpy, Window w, int x, int y, unsigned 
     // keeps its own scale, so it draws smaller than the frame until the
     // runtime's scale follows Live's (see FINDINGS.md).
     if (!windowProps.contains(w) && height >= 100) {
+        maxDeviceViews.insert(w);
         if (const qreal ratio = qApp ? qApp->devicePixelRatio() : 1.0; ratio != 1.0) {
             x = qRound(x * ratio);
             y = qRound(y * ratio);
@@ -370,6 +381,8 @@ extern "C" int XMapWindow(Display *dpy, Window w)
     }
     if (windowProps.contains(w))
         fitToView(dpy, w);
+    else if (maxDeviceViewsHidden && maxDeviceViews.contains(w))
+        return 1; // the device view is not shown: stay hidden
     return real(dpy, w);
 }
 
@@ -447,3 +460,31 @@ extern "C" int XNextEvent(Display *dpy, XEvent *ev)
     }
     return r;
 }
+
+// Called when Live switches between Clip view and Device view: the Max device
+// views are native windows Live does not hide for that, so the shim does.
+void setMaxDeviceViewsHidden(bool hidden)
+{
+    if (maxDeviceViewsHidden == hidden)
+        return;
+    maxDeviceViewsHidden = hidden;
+    Display *dpy = XOpenDisplay(nullptr);
+    if (!dpy)
+        return;
+    for (Window w : maxDeviceViews) {
+        if (hidden)
+            XUnmapWindow(dpy, w);
+        else
+            XMapWindow(dpy, w); // Live does not map them again by itself
+    }
+    XFlush(dpy);
+    XCloseDisplay(dpy);
+    menufixTrace(hidden ? "pluginclose: device views hidden (%d)\n" : "pluginclose: device views shown (%d)\n",
+                 int(maxDeviceViews.size()));
+}
+
+
+// Called on a timer: hide the Max device views whenever Live is showing the
+// clip view instead of the device view.
+
+

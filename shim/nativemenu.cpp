@@ -25,16 +25,22 @@
 #include <QMenuBar>
 #include <QPointer>
 #include <QResizeEvent>
+#include <QKeyEvent>
 #include <QTimer>
 #include <QVariant>
 #include <link.h>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdarg>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 void menufixTrace(const char *fmt, int a = 0, int b = 0, int c = 0);
+
+void setMaxDeviceViewsHidden(bool hidden); // pluginclose.cpp: follows Clip/Device view
+void followViewCommand(int id);            // defined below, used by menu entries and keys
 
 namespace {
 
@@ -272,7 +278,10 @@ void fillMenu(QMenu *menu)
         }
         QObject::connect(action, &QAction::triggered, [id] {
             // Run it once the popup has closed and focus is back in Live's window.
-            QTimer::singleShot(0, [id] { live<void (*)(int, bool)>(kRunMenuCommand)(id, true); });
+            QTimer::singleShot(0, [id] {
+                live<void (*)(int, bool)>(kRunMenuCommand)(id, true);
+                followViewCommand(id);
+            });
         });
     }
     menufixTrace("nativemenu: menu with %d entries, %d px high\n", menu->actions().size(), menu->sizeHint().height());
@@ -644,6 +653,23 @@ void attachBar(QMainWindow *window)
     menufixTrace("nativemenu: bar attached, %d menus\n", bar->actions().size());
 }
 
+// The Max device views are separate windows that Live keeps on screen when the
+// Clip view replaces the device view. They follow Live's own Clip View / Device
+// View commands: both the View menu entries (this file invokes them) and the
+// shortcuts (Alt+3 / Alt+4, which arrive here as key events) go through this.
+// Four-character command ids as Live stores them (little-endian).
+constexpr int kClipViewCommand = 0x666f6363;   // "ccof"
+constexpr int kDeviceViewCommand = 0x666f6364; // "dcof"
+
+void followViewCommand(int id)
+{
+    if (id == kClipViewCommand) {
+        setMaxDeviceViewsHidden(true);
+    } else if (id == kDeviceViewCommand) {
+        setMaxDeviceViewsHidden(false);
+    }
+}
+
 class MenuBarAttacher : public QObject
 {
 public:
@@ -658,6 +684,16 @@ public:
             auto *view = static_cast<QWidget *>(o);
             if (QMenuBar *bar = barOf(view)) {
                 bar->setGeometry(0, 0, view->width(), bar->height());
+            }
+        } else if (e->type() == QEvent::KeyPress) {
+            const auto *key = static_cast<QKeyEvent *>(e);
+            if (key->modifiers() == Qt::AltModifier) {
+                // Live's command table stores 0-based key codes: key=4 is the
+                // "3" key (Clip view), key=5 the "4" key (Device view).
+                if (key->key() == Qt::Key_3)
+                    followViewCommand(kClipViewCommand);
+                else if (key->key() == Qt::Key_4)
+                    followViewCommand(kDeviceViewCommand);
             }
         } else if (e->type() == QEvent::Paint && o->isWidgetType()) {
             if (barOf(static_cast<QWidget *>(o)))
@@ -681,6 +717,8 @@ uintptr_t mainBase()
 
 } // namespace
 
+// MENUFIX_DEBUG: the command table as id | shortcut | title, using only the
+// static entry fields, so a command can be identified from its title.
 void *hookFunction(uintptr_t fn, const unsigned char *prologue, size_t len, void *replacement); // hook.cpp
 bool redirectFunction(uintptr_t fn, const unsigned char *prologue, size_t len, void *target);    // hook.cpp
 extern bool livePaintHooked; // glsurface.cpp: its diagnostic handler calls livePainted
