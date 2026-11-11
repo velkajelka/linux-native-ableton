@@ -12,7 +12,9 @@
 //     Wayland plug-in), desktop file dialogs through xdg-desktop-portal
 //     (LIVE_NATIVE_DIALOGS=0: Live's own);
 //   - LC_NUMERIC=C: Live reads Live Set numbers with the locale's strtod;
-//   - LIVEDEBUGOPTIONS: Options-desktop.txt next to push3_opt/;
+//   - LIVEDEBUGOPTIONS: Options-desktop.txt next to push3_opt/ — its lines
+//     starting with "-_Live" are this project's own settings, applied here
+//     (Live silently ignores unknown options of that shape — verified);
 //   - HOME: the user's own, as for any Linux program (Live then keeps its
 //     settings in ~/.config/Ableton and ~/.local/share/Ableton, and its
 //     libraries in the desktop's Music folder, XDG_MUSIC_DIR/Ableton), or an
@@ -209,6 +211,28 @@ __attribute__((constructor(102))) void setUpEnvironment()
                 fputs("-_LinuxMidiBackend=Alsa\n-SuppressStartUpMessages\n-_DisableAutoUpdates\n", f);
                 fclose(f);
             }
+        // The file also carries settings of this project itself, as lines
+        // starting with "-_Live" — Live silently ignores unknown options of
+        // that shape (verified), so they can stay in the file it reads.
+        if (FILE *f = fopen(options.c_str(), "r")) {
+            char buffer[512];
+            while (fgets(buffer, sizeof buffer, f)) {
+                const std::string line = buffer;
+                if (line.compare(0, 6, "-_Live") != 0)
+                    continue;
+                const size_t eq = line.find('=');
+                const std::string key = line.substr(6, eq == std::string::npos ? std::string::npos : eq - 6);
+                std::string value = eq == std::string::npos ? "" : line.substr(eq + 1);
+                while (!value.empty() && (value.back() == '\n' || value.back() == '\r' || value.back() == ' '))
+                    value.pop_back();
+                if (key == "AudioThreads" && !value.empty() &&
+                    value.find_first_not_of("0123456789") == std::string::npos) {
+                    setenv("LIVE_AUDIO_THREADS", value.c_str(), 0); // an explicit environment wins
+                    menufixTrace("standalone: audio worker threads capped\n", 0, 0, 0);
+                }
+            }
+            fclose(f);
+        }
         setenv("LIVEDEBUGOPTIONS", options.c_str(), 1);
     }
 

@@ -139,6 +139,8 @@ The audio path has settings, all optional:
 | `LIVE_ALSA_MINRING=n` | The smallest ring, in frames (default: PipeWire's quantum; 0 disables) |
 | `LIVE_AUDIO_THREADS=n` | Cap the audio worker threads Live creates (Live sizes them from the cpu count: 15 on a 16-core machine). Nothing is pinned — the threads still run on every core |
 
+These can also be kept in `Options-desktop.txt`, as lines starting with `-_Live`: Live silently ignores unknown options of that shape (verified against 12.4.7), so they can sit in the file it reads, and the shim applies them itself. `-_LiveAudioThreads=8` does what `LIVE_AUDIO_THREADS=8` does, and survives every start.
+
 <br>
 
 ## Where Live keeps its files
