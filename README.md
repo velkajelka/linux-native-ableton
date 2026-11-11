@@ -121,6 +121,30 @@ Because the companion owns the hardware directly, Push devices do **not** appear
 
 <br>
 
+## The browser's device categories
+
+Live lists built-in devices from entries its indexer builds out of the program's
+`Builtin` folder. The Push 3 image's indexer never processes that folder — the
+device did not need it — so **Instruments, Audio Effects, MIDI Effects,
+Modulators and Max for Live** were empty, while Sounds and Drums (plain Core
+Library content) worked.
+
+The installer completes the catalog from the image's own content
+(`tools/browser-catalog.py`): each device's declaration is added to the folder
+Live already indexes that holds its presets, the Max devices and MIDI tools are
+copied where Live indexes them, and the Modulators keyword entries are added to
+the Core Library's metadata manifest. Idempotent, and nothing in Ableton's
+program folder is modified.
+
+If those categories are ever empty again — for example after resetting Live's
+database — run it once and restart Live:
+
+```sh
+~/.local/share/ableton-live-12/tools/browser-catalog.py
+```
+
+<br>
+
 ## Audio and PipeWire
 
 Live talks ALSA, and the shim sends its hardware accesses to PipeWire: Live's device menu lists PipeWire's outputs and inputs (card 100 is "System Default", which follows the desktop's choice), samples leave in floating point instead of being cut to 16 bits, and the sound shares the sound card with the desktop through `pipewire-alsa`.
@@ -169,6 +193,7 @@ Live finds plug-ins in the usual folders (`~/.vst3`, `/usr/lib/vst3`, `/usr/loca
 | Saving and exporting are deactivated | Live is not authorized yet. Authorize it with your Ableton account. |
 | Push 2 or Push 3 stays dark or its LEDs keep flashing | Live's companion cannot open the USB device. Give the user read/write access to Ableton's USB devices (matches Push 2 and Push 3): `echo 'SUBSYSTEM=="usb",ATTR{idVendor}=="2982",MODE="0660",GROUP="audio"' \| sudo tee /etc/udev/rules.d/99-ableton-push.rules && sudo udevadm control --reload && sudo udevadm trigger`, then replug the hardware and restart Live. You must be in the `audio` group. |
 | Audio crackles, and Live's log fills with `State=XRUN` | Live's ring is shorter than one PipeWire cycle. The shim lifts it to cover the quantum automatically; if your quantum is unusual (above 1024 frames), either raise Live's buffer to match (`pw-metadata -n settings` shows the quantum) or set `LIVE_ALSA_MINRING` (see [Audio and PipeWire](#audio-and-pipewire)). |
+| Instruments, Audio Effects, MIDI Effects, Modulators or Max for Live are empty | Live's browser catalog was not completed, or Live rebuilt its database after it was. Quit Live, run `~/.local/share/ableton-live-12/tools/browser-catalog.py`, and start Live again (see [The browser's device categories](#the-browsers-device-categories)). |
 
 <br>
 

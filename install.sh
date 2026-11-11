@@ -78,7 +78,7 @@ export DEBUGFS_PAGER=__none__
 # --- terminal output ------------------------------------------------------------------
 # A numbered line per step, a progress bar under it while it runs, then the
 # time it took. Without a terminal (a log file) only the lines are written.
-STEPS=13
+STEPS=14
 STEP=0
 STEP_START=$SECONDS
 if [ -t 1 ]; then
@@ -519,6 +519,22 @@ else
 fi
 cd "$PREFIX"
 rm -rf "$WORK"
+
+# --- browser catalog ---------------------------------------------------------------
+# Live's browser lists built-in devices from entries its indexer builds out of
+# the program's Builtin folder, which this image's indexer never processes; the
+# device categories (Instruments, Audio Effects, MIDI Effects, Modulators, Max
+# for Live) stay empty while Sounds and Drums work. The catalog is completed
+# from the image's own content (tools/browser-catalog.py).
+step "Completing the browser's device catalog"
+if command -v python3 >/dev/null 2>&1; then
+    python3 "$PREFIX/tools/browser-catalog.py" --program "$APP" --music "$(dirname "$CORE")" \
+        >>"$LOG" 2>&1 ||
+        note "the browser catalog step failed (see install.log): Instruments, Audio Effects, Modulators and Max for Live will be empty."
+else
+    note "python3 is missing, so the browser's device catalog was not completed: Instruments, Audio Effects, Modulators and Max for Live will be empty. Install python3 and run $PREFIX/tools/browser-catalog.py."
+fi
+ok
 
 # --- desktop integration -----------------------------------------------------------
 step "Adding Ableton Live 12 to the application menu"
