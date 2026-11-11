@@ -421,6 +421,10 @@ fi
 step "Installing the shim and the launcher"
 mkdir -p "$PREFIX/shim" "$PREFIX/tools"
 cp "$MODS/shim/libmenufix.so" "$PREFIX/shim/"
+# The Push 3 companion's library stand-in: a device-OS library the image does
+# not carry (shim/swupdate-stub.c). The companion, which Live starts whenever
+# Push hardware is connected, cannot load without it.
+cp "$MODS/shim/libswupdate.so.0.1" "$PREFIX/compat_lib/"
 cp "$MODS/Options-desktop.txt" "$PREFIX/"
 cp -r "$MODS/tools/." "$PREFIX/tools/"
 # Executable here even when the folder came on a USB stick or a Windows file system.

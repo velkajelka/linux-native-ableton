@@ -270,6 +270,59 @@ bool isRegistration(const char *program)
     return (len == 16 && !strncmp(name, "xdg-desktop-menu", len)) || (len == 8 && !strncmp(name, "xdg-mime", len));
 }
 
+// Live starts the Push 3 companion (Push3) by itself whenever Push hardware
+// appears. It was built for the desktop and passes two options the image's
+// device build of Push3 does not parse; the companion answers "Invalid
+// arguments: unrecognised option" and exits before it touches any hardware.
+// Drop the options the image's Push3 does not have (verified against its own
+// option list: parent-process-id, log-level, log-file, dont-log-to-console,
+// log-to-syslog, no-parent, screenshot-filename, python-log-filters,
+// webservice-id-file, update-server-url, crashpad-fd), so Live's launch works.
+
+bool isCompanion(const char *path)
+{
+    if (!shimActive || !path)
+        return false;
+    const char *name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+    return strcmp(name, "Push3") == 0;
+}
+
+bool droppedCompanionOption(const char *arg)
+{
+    static const char *const unsupported[] = {"--show-developer-window", "--language"};
+    for (const char *option : unsupported) {
+        const size_t len = strlen(option);
+        if (!strncmp(arg, option, len) && (arg[len] == '\0' || arg[len] == '='))
+            return true;
+    }
+    return false;
+}
+
+// A filtered argv copy (strings shared with the original), or null when
+// nothing needs dropping. The caller frees the array after the exec attempt.
+char **filteredCompanionArgs(char *const argv[])
+{
+    size_t count = 0;
+    while (argv[count])
+        ++count;
+    size_t kept = 0;
+    for (size_t i = 0; i < count; ++i)
+        kept += !droppedCompanionOption(argv[i]);
+    if (kept == count)
+        return nullptr;
+    auto **copy = static_cast<char **>(malloc((kept + 1) * sizeof(char *)));
+    if (!copy)
+        return nullptr;
+    size_t out = 0;
+    for (size_t i = 0; i < count; ++i)
+        if (!droppedCompanionOption(argv[i]))
+            copy[out++] = argv[i];
+    copy[out] = nullptr;
+    menufixTrace("standalone: companion launched with %d of %d options\n", int(out), int(count));
+    return copy;
+}
+
 // The program itself, or a shell running it: sh -c "xdg-mime install ...".
 bool runsRegistration(const char *path, char *const argv[])
 {
@@ -292,7 +345,10 @@ extern "C" int execv(const char *path, char *const argv[])
     static auto next = real<int (*)(const char *, char *const[])>("execv", "GLIBC_2.2.5");
     if (runsRegistration(path, argv))
         _exit(0); // in Live's child process, before the exec
-    return next(path, argv);
+    char **filtered = isCompanion(path) ? filteredCompanionArgs(argv) : nullptr;
+    const int result = next(path, filtered ? filtered : argv);
+    free(filtered);
+    return result;
 }
 
 extern "C" int execve(const char *path, char *const argv[], char *const envp[])
@@ -300,7 +356,10 @@ extern "C" int execve(const char *path, char *const argv[], char *const envp[])
     static auto next = real<int (*)(const char *, char *const[], char *const[])>("execve", "GLIBC_2.2.5");
     if (runsRegistration(path, argv))
         _exit(0);
-    return next(path, argv, envp);
+    char **filtered = isCompanion(path) ? filteredCompanionArgs(argv) : nullptr;
+    const int result = next(path, filtered ? filtered : argv, envp);
+    free(filtered);
+    return result;
 }
 
 // A spawned process has to exist (the caller waits for it): `true` runs instead.
@@ -312,7 +371,10 @@ extern "C" int posix_spawn(pid_t *pid, const char *path, const posix_spawn_file_
     static char *const trueArgv[] = {const_cast<char *>("true"), nullptr};
     if (runsRegistration(path, argv))
         return next(pid, "/bin/true", actions, attr, trueArgv, envp);
-    return next(pid, path, actions, attr, argv, envp);
+    char **filtered = isCompanion(path) ? filteredCompanionArgs(argv) : nullptr;
+    const int result = next(pid, path, actions, attr, filtered ? filtered : argv, envp);
+    free(filtered);
+    return result;
 }
 
 extern "C" int posix_spawnp(pid_t *pid, const char *file, const posix_spawn_file_actions_t *actions,
@@ -323,7 +385,10 @@ extern "C" int posix_spawnp(pid_t *pid, const char *file, const posix_spawn_file
     static char *const trueArgv[] = {const_cast<char *>("true"), nullptr};
     if (runsRegistration(file, argv))
         return next(pid, "true", actions, attr, trueArgv, envp);
-    return next(pid, file, actions, attr, argv, envp);
+    char **filtered = isCompanion(file) ? filteredCompanionArgs(argv) : nullptr;
+    const int result = next(pid, file, actions, attr, filtered ? filtered : argv, envp);
+    free(filtered);
+    return result;
 }
 
 extern "C" int system(const char *command)
