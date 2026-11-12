@@ -685,7 +685,7 @@ static bool mappedAt(uintptr_t p, size_t len)
     return found;
 }
 
-void followViewCommand(int id)
+void applyViewCommand(int id)
 {
     if (id == kClipViewCommand) {
         setMaxDeviceViewsHidden(true);
@@ -774,6 +774,14 @@ bool detailViewIsDevice()
 }
 
 } // namespace
+
+// Menu entries and keys both reach the view state through this; it has to be
+// outside the anonymous namespace so the menu action lambda (which is emitted
+// before the definition) binds to it instead of an undefined global symbol.
+void followViewCommand(int id)
+{
+    applyViewCommand(id);
+}
 
 // MENUFIX_DEBUG: the command table as id | shortcut | title, using only the
 // static entry fields, so a command can be identified from its title.
