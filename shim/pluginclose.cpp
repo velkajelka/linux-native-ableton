@@ -218,6 +218,62 @@ Fn next(const char *name)
     return reinterpret_cast<Fn>(nextSymbol(name, nullptr));
 }
 
+// Does this return address belong to Live itself (not to a library it loads)?
+// The Max runtime applies its own scale to the windows it creates, so only
+// Live's requests are in Live's unscaled units and need converting.
+bool calledFromLive(void *ret)
+{
+    Dl_info info;
+    if (!dladdr(ret, &info) || !info.dli_fbase)
+        return false;
+    uintptr_t liveBase = 0;
+    dl_iterate_phdr(
+        [](dl_phdr_info *entry, size_t, void *out) {
+            *static_cast<uintptr_t *>(out) = entry->dlpi_addr; // first entry = Live
+            return 1;
+        },
+        &liveBase);
+    return reinterpret_cast<uintptr_t>(info.dli_fbase) == liveBase;
+}
+
+const char *moduleOf(void *address)
+{
+    Dl_info info;
+    return dladdr(address, &info) && info.dli_fname ? info.dli_fname : "?";
+}
+
+// The Max runtime (libMaxPlugLib.so) draws its UI at JUCE's own scale, which on
+// X11 stays 100 %, while Live's interface runs at the window's scale factor.
+// Live hands the device views a rectangle in its units, so at 125 % every Max
+// view filled only four fifths of its frame. The runtime's global scale brings
+// its own window sizing, painting and font metrics to Live's scale; the X
+// interposer below then leaves the runtime's requests alone (they are already
+// scaled) and only converts the ones coming from Live.
+void followMaxRuntimeScale()
+{
+    const char *env = getenv("LIVE_MAX_SCALE");
+    if (env && !strcmp(env, "0"))
+        return;
+    auto getDesktop = reinterpret_cast<void *(*)()>(
+        dlsym(RTLD_DEFAULT, "_ZN4juce7Desktop11getInstanceEv"));
+    auto setScale = reinterpret_cast<void (*)(void *, float)>(
+        dlsym(RTLD_DEFAULT, "_ZN4juce7Desktop20setGlobalScaleFactorEf"));
+    if (!getDesktop || !setScale)
+        return; // the Max runtime is not loaded yet
+    void *desktop = getDesktop();
+    if (!desktop || !qApp)
+        return;
+    const qreal ratio = qApp->devicePixelRatio();
+    if (ratio <= 0)
+        return;
+    float current = 1.0f;
+    memcpy(&current, static_cast<char *>(desktop) + 0x120, sizeof current);
+    if (qAbs(current - float(ratio)) < 0.001f)
+        return;
+    setScale(desktop, float(ratio));
+    menufixTrace("maxscale: runtime scale %d/1000\n", int(ratio * 1000));
+}
+
 } // namespace
 
 void pluginViewCreated(void *view)
@@ -227,6 +283,9 @@ void pluginViewCreated(void *view)
 
 void installPluginCloseHook()
 {
+    auto *scaleTimer = new QTimer(QCoreApplication::instance());
+    QObject::connect(scaleTimer, &QTimer::timeout, [] { followMaxRuntimeScale(); });
+    scaleTimer->start(500);
     base = mainExecutableBase();
     auto *thunk = reinterpret_cast<unsigned char *>(base + kThunk);
     // e9 rel32 to the observer, then padding up to 0x3f2b9b0.
@@ -348,17 +407,28 @@ extern "C" int XMoveResizeWindow(Display *dpy, Window w, int x, int y, unsigned 
 {
     static auto real = next<decltype(&XMoveResizeWindow)>("XMoveResizeWindow");
     // Max for Live device windows. The Max runtime creates them as native X
-    // children of Live's window (juce::Desktop::setGlobalScaleFactor and
-    // jmonitor_getdisplayscalefactor live in libMaxPlugLib.so). Live hands
-    // their rectangle over in its own units (zoom x scale, the units the rest
-    // of its views use), but an X window needs pixels: unscaled, every Max
-    // device sat above and left of its slot by (ratio - 1) times its position.
-    // The window's size is scaled for the same reason; the Max view inside
-    // keeps its own scale, so it draws smaller than the frame until the
-    // runtime's scale follows Live's (see FINDINGS.md).
+    // children of Live's window (juce::Desktop and LinuxComponentPeer live in
+    // libMaxPlugLib.so). Live hands their rectangle over in its own units
+    // (zoom x scale, the units the rest of its views use), but an X window
+    // needs pixels: unscaled, every Max device sat above and left of its slot
+    // by (ratio - 1) times its position. followMaxRuntimeScale() puts the
+    // runtime's own scale at Live's, so its painting fills the scaled window.
     if (!windowProps.contains(w) && height >= 100) {
         maxDeviceViews.insert(w);
-        if (const qreal ratio = qApp ? qApp->devicePixelRatio() : 1.0; ratio != 1.0) {
+        // With the runtime at Live's scale, its own window requests are
+        // already in pixels; only Live's are in its unscaled units.
+        const bool liveUnits = calledFromLive(__builtin_return_address(0));
+        if (getenv("LIVE_LOG_MAXCALLER")) {
+            if (const char *path = getenv("MENUFIX_DEBUG")) {
+                if (FILE *f = fopen(path, "a")) {
+                    fprintf(f, "maxscale: caller %s window 0x%x %d,%d %ux%u\n",
+                            moduleOf(__builtin_return_address(0)), unsigned(w), x, y, width, height);
+                    fclose(f);
+                }
+            }
+        }
+        if (const qreal ratio = qApp ? qApp->devicePixelRatio() : 1.0;
+            liveUnits && ratio != 1.0) {
             x = qRound(x * ratio);
             y = qRound(y * ratio);
             width = unsigned(qRound(width * ratio));
