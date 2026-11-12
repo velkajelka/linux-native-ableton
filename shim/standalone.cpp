@@ -192,9 +192,20 @@ __attribute__((constructor(102))) void setUpEnvironment()
     // scale to a whole number (125 % gave 1x, 150 to 200 % all 2x). Keep the
     // exact factor, so Live scales with the desktop as on Windows.
     setDefault("QT_SCALE_FACTOR_ROUNDING_POLICY", "PassThrough");
+    // Live's file dialogs go through the desktop's portal (filedialogs.cpp).
+    // The KDE portal is a native Wayland client: given an XWayland window, it
+    // cannot parent its dialog to it, so the dialog never appears and Live
+    // waits in the call forever. Wayland sessions therefore use Qt's own
+    // dialog; X11 sessions keep the desktop's native one.
     const char *dialogs = getenv("LIVE_NATIVE_DIALOGS");
-    if (!dialogs || strcmp(dialogs, "0") != 0)
-        setDefault("QT_QPA_PLATFORMTHEME", "xdgdesktopportal");
+    if (!dialogs || strcmp(dialogs, "0") != 0) {
+        const char *session = getenv("XDG_SESSION_TYPE");
+        const char *wayland = getenv("WAYLAND_DISPLAY");
+        const bool xwayland = (session && !strcmp(session, "wayland")) || (wayland && *wayland);
+        if (!xwayland)
+            setDefault("QT_QPA_PLATFORMTHEME", "xdgdesktopportal");
+        menufixTrace("standalone: portal file dialogs %d\n", !xwayland);
+    }
     // Live's PipeWire streams (pipewire-alsa reads this) show as "Ableton Live"
     // in the desktop's volume mixer instead of "PipeWire ALSA [AbletonLive12]".
     loadXkbcommon(app);

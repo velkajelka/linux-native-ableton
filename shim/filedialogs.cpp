@@ -24,11 +24,14 @@
 // puts QFileDialog versions into that table through the same setters, once
 // Live has registered its own, as Windows Live puts its IFileDialog versions
 // there; Live's code is not changed. With
-// QT_QPA_PLATFORMTHEME=xdgdesktopportal (set by run-live-desktop.sh) Qt shows
-// the desktop's own dialog through xdg-desktop-portal: KDE's on Plasma, GTK's
-// on GNOME. Where no portal offers a FileChooser (a bare window manager), that
-// theme would reject every dialog at once, so Qt's own dialog is used instead.
-// LIVE_NATIVE_DIALOGS=0 keeps Live's dialogs.
+// QT_QPA_PLATFORMTHEME=xdgdesktopportal (set by standalone.cpp on X11 sessions)
+// Qt shows the desktop's own dialog through xdg-desktop-portal: KDE's on
+// Plasma, GTK's on GNOME. Wayland sessions leave the theme unset: there the
+// portal is a native Wayland client and cannot parent its dialog to Live's
+// XWayland window - the dialog never appears and Live waits in it forever - so
+// Qt's own dialog is used. Where no portal offers a FileChooser (a bare window
+// manager), Qt's own dialog is used as well. LIVE_NATIVE_DIALOGS=0 keeps
+// Live's dialogs.
 //
 // A path is a std::string (UTF-8). File kinds map to a 128-bit mask of file
 // type ids (0x1be0b80); the ids, names and extensions below are Live's own
