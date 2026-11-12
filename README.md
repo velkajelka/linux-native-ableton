@@ -5,7 +5,7 @@
 
 This project brings you the Linux build of Ableton Live 12 that ships inside the Push 3 recovery image as a normal desktop app. With some custom shims it transforms it into a fully functional Live 12, but running natively on Linux. The content the image lacks (Core Library, lessons, stem models, cursors, icon) comes from the Windows Suite installer.
 
-Ableton's files are not modified, and this repository contains none of them. A small launcher starts Live with a shim library preloaded. The shim makes Live work on the desktop: window, menus, file dialogs, plug-in editors, audio through PipeWire, and mixed-scale monitors.
+Ableton's files are not modified, and this repository contains none of them. A small launcher starts Live with a shim library preloaded. The shim makes Live work on the desktop: window, menus, file dialogs, plug-in editors, audio through PipeWire, mixed-scale monitors, Push hardware and Max for Live device views.
 
 This project is not affiliated with or endorsed by Ableton. Licensing is not touched: Live starts unauthorized, and you authorize it with your own Ableton account as usual.
 
@@ -20,6 +20,7 @@ This project is not affiliated with or endorsed by Ableton. Licensing is not tou
 Other requirements:
 - An x86-64 PC with PipeWire, and glibc 2.35 or newer (Ubuntu 22.04, Mint 21, Debian 12, Fedora 36 or newer).
 - An X11 session or Xwayland. Every mainstream desktop has one; Live runs as an X11 program.
+- `python3`, used by the installer to complete the browser's device catalog. Without it, Instruments, Audio Effects, MIDI Effects, Modulators and Max for Live stay empty (see [The browser's device categories](#the-browsers-device-categories)).
 - About 25 GB of free space while installing, and about 7 GB after (4.5 GB program, 2.1 GB Core Library).
 
 <br>
@@ -70,7 +71,7 @@ GNOME Files opens scripts in the text editor by default. There, right-click `ins
 
 The program goes to `~/.local/share/ableton-live-12`. Use `--prefix DIR` for another folder; the path must not contain spaces or quotes. The installer adds Ableton Live 12 to the application menu. `.als` and `.alp` files and `ableton://` links (used for browser authorization) open in it.
 
-The installation takes about 3 to 6 minutes and shows each of its 13 steps with a progress bar. You can delete the zips afterwards.
+The installation takes about 3 to 6 minutes and shows each step with a progress bar. You can delete the zips afterwards.
 
 ### Program loader
 
@@ -145,6 +146,39 @@ database — run it once and restart Live:
 
 <br>
 
+## Max for Live device views
+
+Max for Live devices draw their interface in their own native windows. On
+Windows those windows are children of the device chain's window, so the OS
+clips them together with it. On Linux Live draws its whole interface in one
+window, and these views were children of it with nothing managing them, so the
+shim took that role: it places each view on its device's frame, follows Live's
+own detail-view state to hide and show them with the Clip and Device views, and
+gives the Max runtime Live's UI scale to draw at.
+
+**Before:** at 125 % each view sat about 350 px above its device frame and
+filled only four fifths of it. Nothing hid the views when Clip view replaced
+the device view, so they stayed on screen over the piano roll, and they also
+stayed when the detail area was collapsed.
+
+**After:** the views sit exactly over their device's frame at any zoom and
+display scale, and fill it. They disappear whenever the detail area shows Clip
+view — and when it is collapsed — and come back with the Device view,
+whichever way you switch (the tabs, Shift+Tab, the View menu, or Alt+3 /
+Alt+4). They also follow Live's UI scale, including a change in Preferences
+while they are open.
+
+All of it follows Live's own detail-view state, so there is nothing to
+configure. Two environment variables turn parts of it off for comparison:
+`LIVE_M4L_NOHIDE=1` keeps the views on screen in Clip view, and
+`LIVE_MAX_SCALE=0` leaves the Max runtime at its own scale.
+
+These hooks are written for Live 12.4.7 from the Push 3 image and check the
+build before using it; on another build they leave the windows untouched
+rather than guess.
+
+<br>
+
 ## Audio and PipeWire
 
 Live talks ALSA, and the shim sends its hardware accesses to PipeWire: Live's device menu lists PipeWire's outputs and inputs (card 100 is "System Default", which follows the desktop's choice), samples leave in floating point instead of being cut to 16 bits, and the sound shares the sound card with the desktop through `pipewire-alsa`.
@@ -194,6 +228,7 @@ Live finds plug-ins in the usual folders (`~/.vst3`, `/usr/lib/vst3`, `/usr/loca
 | Push 2 or Push 3 stays dark or its LEDs keep flashing | Live's companion cannot open the USB device. Give the user read/write access to Ableton's USB devices (matches Push 2 and Push 3): `echo 'SUBSYSTEM=="usb",ATTR{idVendor}=="2982",MODE="0660",GROUP="audio"' \| sudo tee /etc/udev/rules.d/99-ableton-push.rules && sudo udevadm control --reload && sudo udevadm trigger`, then replug the hardware and restart Live. You must be in the `audio` group. |
 | Audio crackles, and Live's log fills with `State=XRUN` | Live's ring is shorter than one PipeWire cycle. The shim lifts it to cover the quantum automatically; if your quantum is unusual (above 1024 frames), either raise Live's buffer to match (`pw-metadata -n settings` shows the quantum) or set `LIVE_ALSA_MINRING` (see [Audio and PipeWire](#audio-and-pipewire)). |
 | Instruments, Audio Effects, MIDI Effects, Modulators or Max for Live are empty | Live's browser catalog was not completed, or Live rebuilt its database after it was. Quit Live, run `~/.local/share/ableton-live-12/tools/browser-catalog.py`, and start Live again (see [The browser's device categories](#the-browsers-device-categories)). |
+| Max for Live device views were misplaced, drawn small, or stayed over the piano roll | The shim's Max view hooks did not match this Live build. They were written for Live 12.4.7 from the Push 3 image and stayed inactive otherwise (see [Max for Live device views](#max-for-live-device-views)). |
 
 <br>
 
@@ -205,12 +240,13 @@ Live finds plug-ins in the usual folders (`~/.vst3`, `/usr/lib/vst3`, `/usr/loca
 | `shim/` | `libmenufix.so` (prebuilt) and its sources |
 | `tools/AbletonLive12-launcher` | The launcher, prebuilt from `tools/launcher.c` (static) |
 | `tools/import-windows-content.sh` | Copies the Core Library, lessons, high-quality stem models and `Installation.cfg` (the edition: Suite) from the Suite installer |
+| `tools/browser-catalog.py` | Completes Live's browser: declares the built-in devices, and copies the Max devices and MIDI tools where Live indexes them (the installer runs it) |
 | `tools/make-assets` | Makes Live's cursors and icon from the Suite's files; prebuilt from `tools/make-assets.cpp`, runs on Live's bundled Qt |
 | `tools/kwin-plugin-rule.sh` | KDE: no minimize button on plug-in windows (the shim runs it) |
 | `tools/bundled/innoextract` | innoextract 1.10-dev, which reads Live 12.4.7's installer |
 | `tools/bundled/libxkbcommon*.so.0` | xkbcommon 1.5.0 from Debian 12, used only when the system has none |
 | `tools/innoextract-compat.cpp` | Lets the bundled innoextract run on glibc 2.35 |
-| `Options-desktop.txt` | Live options: ALSA MIDI, no start-up messages, no auto-updates |
+| `Options-desktop.txt` | Live options (ALSA MIDI, no start-up messages, no auto-updates) and the shim's own `-_Live...` settings |
 
 <br>
 
