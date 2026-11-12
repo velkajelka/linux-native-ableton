@@ -69,7 +69,7 @@ You do not need to install `innoextract`. The installer brings its own (see [inn
 
 GNOME Files opens scripts in the text editor by default. There, right-click `install.sh` and choose "Run as a Program", or use the terminal.
 
-The program goes to `~/.local/share/ableton-live-12`. Use `--prefix DIR` for another folder; the path must not contain spaces or quotes. The installer adds Ableton Live 12 to the application menu. `.als` and `.alp` files and `ableton://` links (used for browser authorization) open in it.
+The program goes to `~/.local/share/ableton-live-12`. Use `--prefix DIR` for another folder; the path must not contain spaces or quotes. The installer adds Ableton Live 12 to the application menu. `.als`, `.alp` and `.auz` files and `ableton://` links (used for browser authorization) open in it.
 
 The installation takes about 3 to 6 minutes and shows each step with a progress bar. You can delete the zips afterwards.
 

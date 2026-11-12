@@ -553,6 +553,10 @@ cat > "$MIME_XML" <<'EOF'
     <comment>Ableton Live Pack</comment>
     <glob pattern="*.alp"/>
   </mime-type>
+  <mime-type type="application/x-ableton-authorization">
+    <comment>Ableton Authorization File</comment>
+    <glob pattern="*.auz"/>
+  </mime-type>
 </mime-info>
 EOF
 cat > "$DESKTOP" <<EOF
@@ -566,7 +570,7 @@ Icon=$APP/products/live/Live/AppLive/Linux/Icons/live_256.png
 Terminal=false
 Categories=Audio;AudioVideo;
 StartupWMClass=ableton-live
-MimeType=application/x-ableton-live-set;application/x-ableton-live-pack;x-scheme-handler/ableton;
+MimeType=application/x-ableton-live-set;application/x-ableton-live-pack;application/x-ableton-authorization;x-scheme-handler/ableton;
 EOF
 command -v update-mime-database >/dev/null && update-mime-database "$DATA_HOME/mime" >/dev/null 2>&1 || true
 command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" >/dev/null 2>&1 || true
