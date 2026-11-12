@@ -40,6 +40,7 @@
 void menufixTrace(const char *fmt, int a = 0, int b = 0, int c = 0);
 
 void setMaxDeviceViewsHidden(bool hidden); // pluginclose.cpp: follows Clip/Device view
+
 void followViewCommand(int id);            // defined below, used by menu entries and keys
 
 namespace {
@@ -640,6 +641,8 @@ void paintHandler(void *self)
     livePainted(field<void *>(window, 0xc0), display);
 }
 
+bool menuBarReady = false; // the main window exists, Live's model is usable
+
 void attachBar(QMainWindow *window)
 {
     QWidget *view = window->centralWidget();
@@ -650,6 +653,7 @@ void attachBar(QMainWindow *window)
     bar->setNativeMenuBar(false);
     bar->hide();
     buildBar(bar);
+    menuBarReady = true;
     menufixTrace("nativemenu: bar attached, %d menus\n", bar->actions().size());
 }
 
@@ -660,6 +664,26 @@ void attachBar(QMainWindow *window)
 // Four-character command ids as Live stores them (little-endian).
 constexpr int kClipViewCommand = 0x666f6363;   // "ccof"
 constexpr int kDeviceViewCommand = 0x666f6364; // "dcof"
+
+// Is [p, p+len) readable in this process? Live's objects are guarded with
+// this before the shim dereferences them.
+static bool mappedAt(uintptr_t p, size_t len)
+{
+    FILE *m = fopen("/proc/self/maps", "r");
+    if (!m)
+        return false;
+    char line[512];
+    bool found = false;
+    while (fgets(line, sizeof line, m)) {
+        uintptr_t lo = 0, hi = 0;
+        if (sscanf(line, "%lx-%lx", &lo, &hi) == 2 && p >= lo && p + len <= hi) {
+            found = true;
+            break;
+        }
+    }
+    fclose(m);
+    return found;
+}
 
 void followViewCommand(int id)
 {
@@ -715,6 +739,40 @@ uintptr_t mainBase()
     return b;
 }
 
+// Live's detail view object (the widget holding the Clip and Device pages)
+// answers "is page N current?". The commands "ccof" and "dcof" are thin
+// wrappers around that method: clip = page 4, device = page 5 (Live+0x135ff80
+// and +0x135ffc0). Reading it tells us what Live is showing, whichever input
+// caused the switch.
+bool detailViewIsDevice()
+{
+    const uintptr_t b = mainBase();
+    if (!b)
+        return true;
+    auto manager = reinterpret_cast<uintptr_t (*)()>(b + kCommandManager)();
+    if (manager) {
+        auto command = reinterpret_cast<uintptr_t (*)(uintptr_t, int, bool)>(b + kFindCommand)(
+            manager, kDeviceViewCommand, true);
+        // Only trust the layout we reversed: "dcof" carries the Device View
+        // handler, and the view's isCurrent slot must be the one we analysed.
+        if (mappedAt(command + 0x50, 8)
+            && *reinterpret_cast<uintptr_t *>(command + 0x40) == b + 0x135ffc0) {
+            const uintptr_t context = *reinterpret_cast<uintptr_t *>(command + 0x48);
+            if (mappedAt(context + 0x28, 8)) {
+                const uintptr_t view = *reinterpret_cast<uintptr_t *>(context + 0x20);
+                if (mappedAt(view, 0xc0)) {
+                    const uintptr_t vtable = *reinterpret_cast<uintptr_t *>(view);
+                    if (mappedAt(vtable + 0x70, 8)
+                        && *reinterpret_cast<uintptr_t *>(vtable + 0x68) == b + 0x13e3280)
+                        return reinterpret_cast<bool (*)(uintptr_t, int)>(
+                            *reinterpret_cast<uintptr_t *>(vtable + 0x68))(view, 5);
+                }
+            }
+        }
+    }
+    return true; // unknown: keep the views visible
+}
+
 } // namespace
 
 // MENUFIX_DEBUG: the command table as id | shortcut | title, using only the
@@ -742,6 +800,21 @@ void installNativeMenu()
     if (!paintHooked || !liveColours || !menuBarView)
         return; // another Live build: Live's own menu band stays
     qApp->installEventFilter(new MenuBarAttacher);
+    if (!getenv("LIVE_M4L_NOHIDE")) {
+        auto *viewTimer = new QTimer(qApp);
+        QObject::connect(viewTimer, &QTimer::timeout, [] {
+            if (!menuBarReady)
+                return;
+            static int last = -1;
+            const bool device = detailViewIsDevice();
+            if (int(device) != last) {
+                last = int(device);
+                menufixTrace("nativemenu: detail view device %d\n", int(device));
+            }
+            setMaxDeviceViewsHidden(!device);
+        });
+        viewTimer->start(250);
+    }
     // Live adds or renames top-level menus at runtime (e.g. after loading a
     // language); check the menu tree regularly (cheap). Without the theme
     // hook, theme changes are found the same way.
