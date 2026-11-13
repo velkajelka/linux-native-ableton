@@ -60,8 +60,11 @@
 #include <QTimer>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <climits>
+#include <cstdarg>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <dlfcn.h>
 #include <link.h>
 #include <sys/mman.h>
@@ -70,6 +73,7 @@
 void menufixTrace(const char *fmt, int a = 0, int b = 0, int c = 0);
 void *nextSymbol(const char *name, const char *version); // embedded.cpp
 void liveOwnPluginWindow(Display *dpy, Window editor); // window.cpp
+void *hookFunction(uintptr_t fn, const unsigned char *prologue, size_t len, void *replacement); // hook.cpp
 
 // VST3 IPlugView (pluginterfaces/gui/iplugview.h), only what is called here.
 // Not in the anonymous namespace: GCC would then know that nothing in this
@@ -112,6 +116,398 @@ namespace {
 // them when a track's devices change, so unmapping is a state it handles.
 QSet<Window> maxDeviceViews;
 bool maxDeviceViewsHidden;
+
+// Live clips a Max view that scrolls out of the device chain to its visible
+// slice: the host window shrinks to a sliver at the viewport edge while the
+// content window shifts inside it, and it is never unmapped. On Windows the
+// chain window clips that sliver away; here the host is a child of Live's
+// window, so it stays on screen over whatever is at the edge. These track the
+// windows currently hidden for that reason and their full (unclipped) size.
+QSet<Window> scrollHidden;
+QHash<Window, int> maxDeviceWidth;
+QHash<Window, int> maxDeviceHeight;
+QHash<Window, int> lastLogicalWidth;
+int chainLeft = INT_MAX; // viewport left edge, logical, seen while clipping
+int chainRight = 0;      // viewport right edge, logical
+
+// Rect diagnostics: LIVE_TRACE_MAXRECTS=1 logs the eight values Live passes to
+// the Max device view's setDeviceRects while the chain scrolls, to find out
+// whether the unclipped device rectangle is available.
+bool rectTraceEnabled()
+{
+    static const bool on = getenv("LIVE_TRACE_MAXRECTS") != nullptr;
+    return on;
+}
+
+void rectTrace(const char *fmt, ...)
+{
+    if (!rectTraceEnabled())
+        return;
+    const char *path = getenv("MENUFIX_DEBUG");
+    if (!path)
+        return;
+    FILE *f = fopen(path, "a");
+    if (!f)
+        return;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    fprintf(f, "recttrace %ld.%06ld ", long(ts.tv_sec), long(ts.tv_nsec / 1000));
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+
+bool managerEnabled()
+{
+    static const bool on = [] {
+        const char *value = getenv("LIVE_M4L_MANAGER");
+        return !value || strcmp(value, "0") != 0;
+    }();
+    return on;
+}
+
+qint64 monotonicMs()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return qint64(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+}
+
+struct LayoutInfo {
+    int x1, y1, x2, y2;
+    qint64 when;
+};
+QHash<unsigned long, LayoutInfo> lastLayout; // full rect per host, from Live
+void *chainView = nullptr;                   // the chain view object
+int viewportLeft = 8;
+int viewportRight = 2469;
+int viewportTop = 1446;
+int viewportBottom = 1615;
+int managerK = 0;
+qint64 managerKWhen = 0;
+QSet<Window> managerHidden;
+
+bool layoutTraceEnabled()
+{
+    static const bool on = getenv("LIVE_TRACE_MAXLAYOUT") != nullptr;
+    return on;
+}
+
+void layoutTrace(const char *fmt, ...)
+{
+    if (!layoutTraceEnabled())
+        return;
+    const char *path = getenv("MENUFIX_DEBUG");
+    if (!path)
+        return;
+    FILE *f = fopen(path, "a");
+    if (!f)
+        return;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    fprintf(f, "layouttrace %ld.%06ld ", long(ts.tv_sec), long(ts.tv_nsec / 1000));
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+
+// Max device layout: arg1 window, arg2 visible (clipped) rect, arg3 full
+// (unclipped) device rect, each as x1,y1,x2,y2. Live computes both in its
+// caller; the caller address is the key to where the chain scroll lives.
+using LayoutFn = void (*)(void *, const int *, const int *);
+LayoutFn originalLayout;
+
+void hookedLayout(void *window, const int *visible, const int *full)
+{
+    if (visible && full) {
+        const qint64 now = monotonicMs();
+        lastLayout[(unsigned long)window] = {full[0], full[1], full[2], full[3], now};
+        if (visible[0] > full[0])
+            viewportLeft = visible[0];
+        if (visible[2] < full[2])
+            viewportRight = visible[2];
+        viewportTop = full[1];
+        viewportBottom = full[3];
+    }
+    if (layoutTraceEnabled() && visible && full) {
+        layoutTrace("win=0x%lx visible=%d,%d,%d,%d full=%d,%d,%d,%d caller=0x%lx",
+                    (unsigned long)window, visible[0], visible[1], visible[2], visible[3], full[0], full[1],
+                    full[2], full[3], (unsigned long)__builtin_return_address(0));
+    }
+    if (originalLayout)
+        originalLayout(window, visible, full);
+}
+
+bool chainTraceEnabled()
+{
+    static const bool on = getenv("LIVE_TRACE_CHAINVIEW") != nullptr;
+    return on;
+}
+
+void chainTrace(const char *fmt, ...)
+{
+    if (!chainTraceEnabled())
+        return;
+    const char *path = getenv("MENUFIX_DEBUG");
+    if (!path)
+        return;
+    FILE *f = fopen(path, "a");
+    if (!f)
+        return;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    fprintf(f, "chaintrace %ld.%06ld ", long(ts.tv_sec), long(ts.tv_nsec / 1000));
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
+
+// Device-chain layout routine (Live+0x2074fd0): walks the view list at
+// this+0x28 and computes the full/visible rectangles. Its fields are where
+// the chain scroll must live.
+struct MaxViewRect {
+    int32_t x1, y1, x2, y2;
+};
+using ViewRectFn = MaxViewRect (*)(void *);
+ViewRectFn viewRectFn;
+
+using ChainLayoutFn = void (*)(void *, void *, void *);
+ChainLayoutFn originalChainLayout;
+
+void hookedChainLayout(void *self, void *arg2, void *arg3)
+{
+    chainView = self;
+    if (chainTraceEnabled() && self) {
+        // Log only the fields that change, comparing against the previous pass.
+        constexpr int kWords = 0x40; // 0x200 bytes
+        static void *previousSelf = nullptr;
+        static uint64_t previous[kWords];
+        const auto *words = reinterpret_cast<const uint64_t *>(self);
+        if (self != previousSelf) {
+            chainTrace("self=0x%lx a2=0x%lx a3=0x%lx", (unsigned long)self, (unsigned long)arg2,
+                       (unsigned long)arg3);
+            for (int i = 0; i < kWords; ++i)
+                previous[i] = words[i];
+            previousSelf = self;
+        } else {
+            for (int i = 0; i < kWords; ++i) {
+                const uint64_t value = words[i];
+                if (value != previous[i]) {
+                    chainTrace("+%03x %016lx -> %016lx", i * 8, (unsigned long)previous[i],
+                               (unsigned long)value);
+                    previous[i] = value;
+                }
+            }
+        }
+
+        // Throttled: ask Live for every view's rectangle, including views
+        // that are no longer laid out. Nodes: +0 next, +8 view, +0x10 window.
+        static struct timespec lastRects {};
+        struct timespec now {};
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        const long elapsed = (now.tv_sec - lastRects.tv_sec) * 1000
+                             + (now.tv_nsec - lastRects.tv_nsec) / 1000000;
+        if (elapsed >= 150 && viewRectFn) {
+            lastRects = now;
+            void *node = *reinterpret_cast<void **>(static_cast<char *>(self) + 0x28);
+            for (int i = 0; node && i < 32; ++i) {
+                void *next = *reinterpret_cast<void **>(node);
+                void *view = *reinterpret_cast<void **>(static_cast<char *>(node) + 0x08);
+                const unsigned long window =
+                    *reinterpret_cast<unsigned long *>(static_cast<char *>(node) + 0x10);
+                MaxViewRect rect{};
+                if (view)
+                    rect = viewRectFn(view);
+                chainTrace("node=0x%lx view=0x%lx win=0x%lx rect=%d,%d,%d,%d",
+                           (unsigned long)node, (unsigned long)view, window, rect.x1, rect.y1, rect.x2,
+                           rect.y2);
+                node = next;
+            }
+        }
+    }
+    if (originalChainLayout)
+        originalChainLayout(self, arg2, arg3);
+}
+
+using SetRectsFn = void (*)(void *, int, int, int, int, int, int, int, int);
+SetRectsFn originalViewRects;
+SetRectsFn originalWindowRects;
+
+using GetArrayFn = long (*)(void *, void *, long, long *);
+GetArrayFn originalGetArray;
+using GetSysWindFn = unsigned long (*)(void *);
+GetSysWindFn livewindGetSysWind;
+
+long hookedGetArray(void *object, void *symbol, long maxlen, long *values)
+{
+    if (!originalGetArray)
+        return 0; // the trampoline is installed just after the patch; do not call null
+    const long count = originalGetArray(object, symbol, maxlen, values);
+    if (!rectTraceEnabled() || !symbol || count <= 0)
+        return count;
+    const char *name = *reinterpret_cast<const char **>(symbol);
+    if (!name || !strstr(name, "devicerect"))
+        return count;
+    unsigned long window = 0;
+    if (livewindGetSysWind)
+        window = livewindGetSysWind(object);
+    rectTrace("get object=0x%lx window=0x%lx %s n=%ld %ld %ld %ld %ld %ld %ld %ld %ld",
+              (unsigned long)object, window, name, count, count > 0 ? values[0] : 0, count > 1 ? values[1] : 0,
+              count > 2 ? values[2] : 0, count > 3 ? values[3] : 0, count > 4 ? values[4] : 0,
+              count > 5 ? values[5] : 0, count > 6 ? values[6] : 0, count > 7 ? values[7] : 0);
+    return count;
+}
+
+void hookedViewRects(void *self, int a1, int a2, int a3, int a4, int a5, int a6, int a7, int a8)
+{
+    rectTrace("view self=0x%lx %d %d %d %d %d %d %d %d", (unsigned long)self, a1, a2, a3, a4, a5, a6, a7,
+              a8);
+    if (originalViewRects)
+        originalViewRects(self, a1, a2, a3, a4, a5, a6, a7, a8);
+}
+
+void hookedWindowRects(void *self, int a1, int a2, int a3, int a4, int a5, int a6, int a7, int a8)
+{
+    rectTrace("window self=0x%lx %d %d %d %d %d %d %d %d", (unsigned long)self, a1, a2, a3, a4, a5, a6, a7,
+              a8);
+    if (originalWindowRects)
+        originalWindowRects(self, a1, a2, a3, a4, a5, a6, a7, a8);
+}
+
+// Patches a Max runtime wrapper whose entry is a tail jump (the view variant
+// first zeroes x and y) and returns a trampoline that reproduces it. The usual
+// hookFunction cannot be used: it copies the prologue, which here contains a
+// position-dependent jump.
+void *hookTailJump(uintptr_t fn, void *replacement, bool zeroXY)
+{
+    auto *code = reinterpret_cast<unsigned char *>(fn);
+    int32_t rel = 0;
+    size_t jmpAt = 0;
+    if (zeroXY) {
+        if (code[0] != 0x31 || code[1] != 0xf6 || code[2] != 0x31 || code[3] != 0xd2 || code[4] != 0xe9) {
+            menufixTrace("recttrace: view prologue mismatch\n");
+            return nullptr;
+        }
+        memcpy(&rel, code + 5, 4);
+        jmpAt = 9;
+    } else {
+        if (code[0] != 0xe9) {
+            menufixTrace("recttrace: window prologue mismatch\n");
+            return nullptr;
+        }
+        memcpy(&rel, code + 1, 4);
+        jmpAt = 5;
+    }
+    const uintptr_t target = fn + jmpAt + rel;
+    const size_t page = sysconf(_SC_PAGESIZE);
+    void *mem = mmap(nullptr, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mem == MAP_FAILED)
+        return nullptr;
+    auto *trampoline = static_cast<unsigned char *>(mem);
+    size_t n = 0;
+    if (zeroXY) {
+        trampoline[n++] = 0x31; // xor esi, esi
+        trampoline[n++] = 0xf6;
+        trampoline[n++] = 0x31; // xor edx, edx
+        trampoline[n++] = 0xd2;
+    }
+    trampoline[n++] = 0x48; // movabs rax, target
+    trampoline[n++] = 0xb8;
+    memcpy(trampoline + n, &target, 8);
+    n += 8;
+    trampoline[n++] = 0xff; // jmp rax
+    trampoline[n++] = 0xe0;
+    mprotect(mem, page, PROT_READ | PROT_EXEC);
+
+    unsigned char patch[12] = {0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xe0};
+    const uintptr_t to = reinterpret_cast<uintptr_t>(replacement);
+    memcpy(patch + 2, &to, 8);
+    const uintptr_t pageBase = fn & ~(page - 1);
+    const size_t span = ((fn + sizeof patch + page - 1) & ~(page - 1)) - pageBase;
+    if (mprotect(reinterpret_cast<void *>(pageBase), span, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        munmap(mem, page);
+        return nullptr;
+    }
+    memcpy(code, patch, sizeof patch);
+    __builtin___clear_cache(reinterpret_cast<char *>(code), reinterpret_cast<char *>(code) + sizeof patch);
+    mprotect(reinterpret_cast<void *>(pageBase), span, PROT_READ | PROT_EXEC);
+    return mem;
+}
+
+void installMaxRectTrace()
+{
+    if (!rectTraceEnabled())
+        return;
+    auto *timer = new QTimer(QCoreApplication::instance());
+    QObject::connect(timer, &QTimer::timeout, [timer] {
+        if (!originalViewRects) {
+            if (void *symbol = dlsym(RTLD_DEFAULT, "_ZN23LiveDeviceViewComponent14setDeviceRectsEiiiiiiii"))
+                originalViewRects = reinterpret_cast<SetRectsFn>(hookTailJump(
+                    reinterpret_cast<uintptr_t>(symbol), reinterpret_cast<void *>(&hookedViewRects), true));
+        }
+        if (!originalWindowRects) {
+            if (void *symbol = dlsym(RTLD_DEFAULT, "_ZN25LiveDeviceWindowComponent14setDeviceRectsEiiiiiiii"))
+                originalWindowRects = reinterpret_cast<SetRectsFn>(hookTailJump(
+                    reinterpret_cast<uintptr_t>(symbol), reinterpret_cast<void *>(&hookedWindowRects), false));
+        }
+        if (!originalGetArray) {
+            if (void *symbol = dlsym(RTLD_DEFAULT, "object_attr_getlong_array")) {
+                unsigned char prologue[29]; // through the second movq; instruction boundary
+                memcpy(prologue, symbol, sizeof prologue);
+                originalGetArray = reinterpret_cast<GetArrayFn>(hookFunction(
+                    reinterpret_cast<uintptr_t>(symbol), prologue, sizeof prologue,
+                    reinterpret_cast<void *>(&hookedGetArray)));
+            }
+        }
+        if (!livewindGetSysWind)
+            livewindGetSysWind = reinterpret_cast<GetSysWindFn>(dlsym(RTLD_DEFAULT, "livewind_getsyswind"));
+        if (originalGetArray) {
+            menufixTrace("recttrace: view %d window %d get %d\n", int(bool(originalViewRects)),
+                         int(bool(originalWindowRects)), int(bool(originalGetArray)));
+            timer->deleteLater();
+        }
+    });
+    timer->start(500);
+}
+
+// Scroll diagnostics: LIVE_TRACE_MAXWINDOWS=1 logs every move/map/unmap of the
+// Max device windows to MENUFIX_DEBUG, with timestamps, so Live's behaviour
+// during horizontal scrolling can be measured.
+bool scrollTraceEnabled()
+{
+    static const bool on = getenv("LIVE_TRACE_MAXWINDOWS") != nullptr;
+    return on;
+}
+
+void scrollTrace(const char *fmt, ...)
+{
+    if (!scrollTraceEnabled())
+        return;
+    const char *path = getenv("MENUFIX_DEBUG");
+    if (!path)
+        return;
+    FILE *f = fopen(path, "a");
+    if (!f)
+        return;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    fprintf(f, "maxscroll %ld.%06ld ", long(ts.tv_sec), long(ts.tv_nsec / 1000));
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
 
 
 
@@ -200,6 +596,122 @@ void observerHook(void *controller, void *prop, int changeType)
     currentProp = saved;
 }
 
+uintptr_t mainExecutableBase();
+
+void installMaxLayoutTrace()
+{
+    if (!layoutTraceEnabled() && !managerEnabled())
+        return;
+    const uintptr_t fn = mainExecutableBase() + 0x2002150;
+    const unsigned char expected[13] = {0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41,
+                                        0x54, 0x53, 0x48, 0x83, 0xec, 0x40};
+    unsigned char prologue[sizeof expected];
+    memcpy(prologue, reinterpret_cast<void *>(fn), sizeof prologue);
+    if (memcmp(prologue, expected, sizeof expected) != 0) {
+        menufixTrace("layouttrace: prologue mismatch\n");
+        return;
+    }
+    originalLayout = reinterpret_cast<LayoutFn>(
+        hookFunction(fn, prologue, sizeof prologue, reinterpret_cast<void *>(&hookedLayout)));
+    menufixTrace("layouttrace: hook %d\n", int(bool(originalLayout)));
+}
+
+void installChainLayoutTrace()
+{
+    if (!chainTraceEnabled() && !managerEnabled())
+        return;
+    const uintptr_t fn = mainExecutableBase() + 0x2074fd0;
+    const unsigned char expected[17] = {0x55, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41,
+                                        0x54, 0x53, 0x48, 0x81, 0xec, 0x18, 0x01, 0x00, 0x00};
+    unsigned char prologue[sizeof expected];
+    memcpy(prologue, reinterpret_cast<void *>(fn), sizeof prologue);
+    if (memcmp(prologue, expected, sizeof expected) != 0) {
+        menufixTrace("chaintrace: prologue mismatch\n");
+        return;
+    }
+    originalChainLayout = reinterpret_cast<ChainLayoutFn>(
+        hookFunction(fn, prologue, sizeof prologue, reinterpret_cast<void *>(&hookedChainLayout)));
+    viewRectFn = reinterpret_cast<ViewRectFn>(mainExecutableBase() + 0x20ab930);
+    menufixTrace("chaintrace: hook %d\n", int(bool(originalChainLayout)));
+}
+
+// Keeps every Max device view on its device. Live gives us the unclipped
+// device rect through the chain view's list (viewRectFn); the screen mapping
+// K = full_rect - node_rect is taken from the last view Live laid out. Each
+// pass places or hides all views from that mapping, so views Live stops
+// updating are handled too.
+void manageMaxDeviceViews()
+{
+    if (!managerEnabled() || maxDeviceViewsHidden)
+        return;
+    if (!chainView || !viewRectFn || !originalLayout)
+        return;
+    static Display *dpy = XOpenDisplay(nullptr);
+    if (!dpy)
+        return;
+    struct Node {
+        unsigned long win;
+        MaxViewRect rect;
+    };
+    Node nodes[64];
+    int count = 0;
+    void *node = *reinterpret_cast<void **>(static_cast<char *>(chainView) + 0x28);
+    while (node && count < 64) {
+        void *next = *reinterpret_cast<void **>(node);
+        void *view = *reinterpret_cast<void **>(static_cast<char *>(node) + 0x08);
+        const unsigned long win = *reinterpret_cast<unsigned long *>(static_cast<char *>(node) + 0x10);
+        if (view && win) {
+            nodes[count].win = win;
+            nodes[count].rect = viewRectFn(view);
+            ++count;
+        }
+        node = next;
+    }
+    if (!count)
+        return;
+
+    const qint64 now = monotonicMs();
+    int k = 0;
+    qint64 best = -1;
+    for (int i = 0; i < count; ++i) {
+        auto it = lastLayout.find(nodes[i].win);
+        if (it != lastLayout.end() && now - it->when < 5000 && it->when > best) {
+            k = it->x1 - nodes[i].rect.x1;
+            best = it->when;
+        }
+    }
+    if (best < 0) {
+        if (managerKWhen && now - managerKWhen < 5000)
+            k = managerK;
+        else
+            return;
+    } else {
+        managerK = k;
+        managerKWhen = now;
+    }
+
+    const int left = viewportLeft;
+    const int right = viewportRight > viewportLeft ? viewportRight : 2469;
+    const int top = viewportTop;
+    const int bottom = viewportBottom;
+    for (int i = 0; i < count; ++i) {
+        const int sx1 = nodes[i].rect.x1 + k, sy1 = nodes[i].rect.y1;
+        const int sx2 = nodes[i].rect.x2 + k, sy2 = nodes[i].rect.y2;
+        const int ix1 = qMax(sx1, left), iy1 = qMax(sy1, top);
+        const int ix2 = qMin(sx2, right), iy2 = qMin(sy2, bottom);
+        if (ix1 >= ix2 || iy1 >= iy2) {
+            managerHidden.insert(nodes[i].win);
+            XUnmapWindow(dpy, nodes[i].win);
+        } else {
+            managerHidden.remove(nodes[i].win);
+            int visible[4] = {ix1, iy1, ix2, iy2};
+            int full[4] = {sx1, sy1, sx2, sy2};
+            originalLayout(reinterpret_cast<void *>(nodes[i].win), visible, full);
+        }
+    }
+    XFlush(dpy);
+}
+
 uintptr_t mainExecutableBase()
 {
     uintptr_t b = 0;
@@ -286,7 +798,15 @@ void installPluginCloseHook()
     auto *scaleTimer = new QTimer(QCoreApplication::instance());
     QObject::connect(scaleTimer, &QTimer::timeout, [] { followMaxRuntimeScale(); });
     scaleTimer->start(500);
+    installMaxRectTrace();
     base = mainExecutableBase();
+    installMaxLayoutTrace();
+    installChainLayoutTrace();
+    if (managerEnabled()) {
+        auto *viewManager = new QTimer(qApp);
+        QObject::connect(viewManager, &QTimer::timeout, [] { manageMaxDeviceViews(); });
+        viewManager->start(33);
+    }
     auto *thunk = reinterpret_cast<unsigned char *>(base + kThunk);
     // e9 rel32 to the observer, then padding up to 0x3f2b9b0.
     int32_t rel;
@@ -406,6 +926,9 @@ void fitToView(Display *dpy, Window w)
 extern "C" int XMoveResizeWindow(Display *dpy, Window w, int x, int y, unsigned width, unsigned height)
 {
     static auto real = next<decltype(&XMoveResizeWindow)>("XMoveResizeWindow");
+    const int inX = x, inY = y;
+    const unsigned inWidth = width, inHeight = height;
+    bool mapAfter = false, unmapAfter = false;
     // Max for Live device windows. The Max runtime creates them as native X
     // children of Live's window (juce::Desktop and LinuxComponentPeer live in
     // libMaxPlugLib.so). Live hands their rectangle over in its own units
@@ -434,9 +957,81 @@ extern "C" int XMoveResizeWindow(Display *dpy, Window w, int x, int y, unsigned 
             width = unsigned(qRound(width * ratio));
             height = unsigned(qRound(height * ratio));
         }
+        if (!managerEnabled()) {
+        // Track the full (unclipped) size this window has had. Live shrinks
+        // the host to the visible slice while scrolling; once that slice is a
+        // small fraction of the device, hide it instead of leaving a sliver
+        // over the device at the viewport edge. Scrolling back grows it again.
+        const int fullWidth = qMax(maxDeviceWidth.value(w, 1), int(inWidth));
+        const int fullHeight = qMax(maxDeviceHeight.value(w, 1), int(inHeight));
+        maxDeviceWidth[w] = fullWidth;
+        maxDeviceHeight[w] = fullHeight;
+        const bool mostlyOut = int(inWidth) * 5 < fullWidth || int(inHeight) * 5 < fullHeight;
+
+        // Live also has a layout bug when the chain jumps: it moves a clipped
+        // view straight back to its base slot at full size, with the content at
+        // 0, as if the chain were not scrolled. That leaves the window over
+        // other devices. A real scroll first grows the view at the viewport
+        // edge; only then does it move to its slot. Treat a clipped -> full
+        // jump that skips the edge as stale and keep the window hidden until a
+        // clipped or edge state arrives again.
+        bool staleLayout = false;
+        if (inY != 0) { // host windows; the content child sits at y = 0
+            const int logicalWidth = int(inWidth);
+            const int logicalX = inX;
+            const bool clipped = logicalWidth < fullWidth;
+            bool validFull = false;
+            if (clipped) {
+                // A clipped host sits at a viewport edge: the left one is at
+                // the chain's small left margin, the right one further in.
+                if (logicalX <= 64) {
+                    if (logicalX < chainLeft)
+                        chainLeft = logicalX;
+                } else {
+                    const int right = logicalX + logicalWidth;
+                    if (right > chainRight)
+                        chainRight = right;
+                }
+            } else {
+                const bool atLeft = chainLeft != INT_MAX && logicalX <= chainLeft + 1;
+                const bool atRight = chainRight > 0 && logicalX + fullWidth >= chainRight - 1;
+                validFull = atLeft || atRight;
+            }
+            const bool wasClipped = lastLogicalWidth.value(w, fullWidth) < fullWidth;
+            staleLayout = logicalWidth == fullWidth && !validFull && (wasClipped || scrollHidden.contains(w));
+            lastLogicalWidth[w] = logicalWidth;
+        }
+
+        if (mostlyOut || staleLayout) {
+            if (!scrollHidden.contains(w)) {
+                scrollHidden.insert(w);
+                unmapAfter = true;
+                scrollTrace("scroll-hide w=0x%x %ux%u of %dx%d%s", unsigned(w), inWidth, inHeight, fullWidth,
+                            fullHeight, staleLayout ? " stale" : "");
+            }
+        } else if (scrollHidden.remove(w)) {
+            mapAfter = true;
+            scrollTrace("scroll-show w=0x%x %ux%u of %dx%d", unsigned(w), inWidth, inHeight, fullWidth,
+                        fullHeight);
+        }        }
+
     }
-    if (!windowProps.contains(w))
-        return real(dpy, w, x, y, width, height);
+    if (scrollTraceEnabled() && !windowProps.contains(w)) {
+        XWindowAttributes attributes{};
+        const bool mapped = XGetWindowAttributes(dpy, w, &attributes) && attributes.map_state != IsUnmapped;
+        scrollTrace("move w=0x%x max=%d mapped=%d in=%d,%d %ux%u out=%d,%d %ux%u dpr=%.3f caller=%s",
+                    unsigned(w), int(maxDeviceViews.contains(w)), int(mapped), inX, inY, inWidth, inHeight,
+                    x, y, width, height, qApp ? double(qApp->devicePixelRatio()) : 1.0,
+                    moduleOf(__builtin_return_address(0)));
+    }
+    if (!windowProps.contains(w)) {
+        const int result = real(dpy, w, x, y, width, height);
+        if (unmapAfter && !maxDeviceViewsHidden)
+            XUnmapWindow(dpy, w);
+        if (mapAfter && !maxDeviceViewsHidden)
+            XMapWindow(dpy, w);
+        return result;
+    }
     fitSizeHints(dpy, w, width, height);
     rememberSize(w, width, height);
     return real(dpy, w, x, y, width, height);
@@ -445,20 +1040,26 @@ extern "C" int XMoveResizeWindow(Display *dpy, Window w, int x, int y, unsigned 
 extern "C" int XMapWindow(Display *dpy, Window w)
 {
     static auto real = next<decltype(&XMapWindow)>("XMapWindow");
+    if (scrollTraceEnabled() && !windowProps.contains(w))
+        scrollTrace("map w=0x%x max=%d hidden=%d", unsigned(w), int(maxDeviceViews.contains(w)),
+                    int(maxDeviceViewsHidden));
     if (pendingUnmaps.remove(w)) {
         menufixTrace("pluginclose: editor 0x%x hidden and shown again, kept mapped\n", int(w));
         return 1;
     }
     if (windowProps.contains(w))
         fitToView(dpy, w);
-    else if (maxDeviceViewsHidden && maxDeviceViews.contains(w))
-        return 1; // the device view is not shown: stay hidden
+    else if (scrollHidden.contains(w) || managerHidden.contains(w)
+             || (maxDeviceViewsHidden && maxDeviceViews.contains(w)))
+        return 1; // scrolled out of the chain, or the device view is not shown
     return real(dpy, w);
 }
 
 extern "C" int XUnmapWindow(Display *dpy, Window w)
 {
     static auto real = next<decltype(&XUnmapWindow)>("XUnmapWindow");
+    if (scrollTraceEnabled() && !windowProps.contains(w))
+        scrollTrace("unmap w=0x%x max=%d", unsigned(w), int(maxDeviceViews.contains(w)));
     if (!windowProps.contains(w))
         return real(dpy, w);
     pendingUnmaps.insert(w, dpy);
@@ -497,6 +1098,12 @@ extern "C" int XDestroyWindow(Display *dpy, Window w)
     windowProps.remove(w);
     pendingUnmaps.remove(w);
     editors.remove(w);
+    maxDeviceViews.remove(w);
+    scrollHidden.remove(w);
+    managerHidden.remove(w);
+    lastLayout.remove((unsigned long)w);
+    maxDeviceWidth.remove(w);
+    maxDeviceHeight.remove(w);
     return real(dpy, w);
 }
 
@@ -544,7 +1151,7 @@ void setMaxDeviceViewsHidden(bool hidden)
     for (Window w : maxDeviceViews) {
         if (hidden)
             XUnmapWindow(dpy, w);
-        else
+        else if (!scrollHidden.contains(w) && !managerHidden.contains(w))
             XMapWindow(dpy, w); // Live does not map them again by itself
     }
     XFlush(dpy);
