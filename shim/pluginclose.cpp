@@ -56,11 +56,13 @@
 // thunk does not hold the expected bytes.
 #include <QApplication>
 #include <QHash>
+#include <QPair>
 #include <QSet>
 #include <QTimer>
 #include <QVector>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -109,6 +111,9 @@ using pluginview::ViewRect;
 using pluginview::kResultTrue;
 
 namespace {
+
+// Defined below; the layout hook uses it to tell Live's calls from this file's.
+bool calledFromLive(void *ret);
 
 // Max for Live device views: the native X children of Live's window that the
 // shim repositions. They have to disappear when the device view is not shown
@@ -209,6 +214,10 @@ void *chainView = nullptr;                   // the chain view object
 int viewportLeft = 8;
 int viewportRight = 2469;
 int viewportParentWidth = 0;    // Live window width when the right edge was learned
+int viewportPanelUnits = -1;    // window right minus chain right (side panel), units
+double lastWindowUnits = 0.0;   // window width in chain units, as of the last pass
+double pendingPanelUnits = -1.0;
+int panelAgreements = 0;
 bool viewportRightUpdated = false;
 qint64 viewportRightWhen = 0;
 int viewportTop = 1446;
@@ -230,22 +239,58 @@ struct Placement {
 QHash<unsigned long, Placement> lastPlacement;
 QSet<unsigned long> nudgedHosts;
 
+// Last laid-out width per host, to tell a translation (info view, instrument
+// inserted at the left) from a zoom change, which rescales every view.
+QHash<unsigned long, int> lastLayoutW;
+double pendingShiftX = 0.0;
+double pendingShiftY = 0.0;
+int originShiftPasses = 0;
+
 using LayoutFn = void (*)(void *, const int *, const int *);
 LayoutFn originalLayout;
 
 void hookedLayout(void *window, const int *visible, const int *full)
 {
-    if (visible && full) {
+    // Only Live's own layout calls are authoritative: the manager calls this
+    // routine too when it places a view, and a rect it computed from a guess
+    // must not become the reference it is checked against.
+    if (visible && full && calledFromLive(__builtin_return_address(0))) {
         const qint64 now = monotonicMs();
         lastLayout[(unsigned long)window] = {full[0],    full[1],    full[2],    full[3],
                                              visible[0], visible[1], visible[2], visible[3],
                                              now};
         if (visible[0] > full[0])
             viewportLeft = visible[0];
-        if (visible[2] < full[2]) {
+        // Only a view with something visible says where the chain ends. A
+        // view that is entirely outside reports a zero-width rect whose x is
+        // its own clamped position, and taking that as the boundary made the
+        // right edge unpredictable (and let hosts sit under the side panel).
+        if (visible[2] < full[2] && visible[2] > visible[0] && visible[3] > visible[1]) {
             viewportRight = visible[2];
             viewportRightWhen = now;
             viewportRightUpdated = true;
+            // The side panel's width is learned as an inset from the window,
+            // measured against the window size in effect during this clip. A
+            // single clip can be a transient clamp (Live's 800 px startup
+            // window produced one), and believing it shrinks the chain and
+            // hides the leftmost views, so an inset is adopted only when two
+            // consecutive clips agree. A real panel edge repeats whenever a
+            // device straddles it.
+            if (lastWindowUnits > 0.0) {
+                const double panel = lastWindowUnits - double(viewportRight);
+                if (panel >= 0.0 && panel < lastWindowUnits / 3.0) {
+                    if (qAbs(panel - pendingPanelUnits) <= 2.0) {
+                        if (++panelAgreements >= 2)
+                            viewportPanelUnits = qRound(panel);
+                    } else {
+                        pendingPanelUnits = panel;
+                        panelAgreements = 1;
+                    }
+                }
+            }
+            menufixTrace("maxviews: right from clip win %x vis ", int((unsigned long)window));
+            menufixTrace("%d..%d full ", visible[0], visible[2]);
+            menufixTrace("%d..%d\n", full[0], full[2]);
         }
         viewportTop = full[1];
         viewportBottom = full[3];
@@ -522,7 +567,7 @@ bool nudgeMaxContent(Display *dpy, Window host)
     if (!XQueryTree(dpy, host, &root, &parent, &children, &count))
         return false;
     Window content = 0;
-    int width = 0, height = 0;
+    int width = 0, height = 0, contentX = 0, contentY = 0;
     long bestArea = -1;
     for (unsigned i = 0; i < count; ++i) {
         XWindowAttributes attrs;
@@ -534,15 +579,19 @@ bool nudgeMaxContent(Display *dpy, Window host)
             content = children[i];
             width = attrs.width;
             height = attrs.height;
+            contentX = attrs.x;
+            contentY = attrs.y;
         }
     }
     if (children)
         XFree(children);
     if (!content || width <= 1 || height <= 1)
         return false;
-    XMoveResizeWindow(dpy, content, 0, 0, unsigned(width - 1), unsigned(height));
+    // Keep the content where the runtime put it: a view clipped at the chain
+    // edge carries an offset that must survive the nudge.
+    XMoveResizeWindow(dpy, content, contentX, contentY, unsigned(width - 1), unsigned(height));
     XSync(dpy, False);
-    XMoveResizeWindow(dpy, content, 0, 0, unsigned(width), unsigned(height));
+    XMoveResizeWindow(dpy, content, contentX, contentY, unsigned(width), unsigned(height));
     XFlush(dpy);
     return true;
 }
@@ -607,6 +656,8 @@ void manageMaxDeviceViews()
         if (!ranges.contains(node, kNodeSize)) {
             menufixTrace("maxviews: node %x gone, chain dropped\n", int(reinterpret_cast<quintptr>(node)));
             chainView = nullptr; // stale list; wait for the next chain layout
+            lastLayoutW.clear();
+            originShiftPasses = 0;
             return;
         }
         void *next = *reinterpret_cast<void **>(node);
@@ -651,18 +702,87 @@ void manageMaxDeviceViews()
 
     const qint64 now = monotonicMs();
 
+    // The chain can move on screen without its devices moving within it: the
+    // info view opens, an instrument is inserted at the left, the detail area
+    // changes. Compare each view's implied offset (laid-out x minus zoomed
+    // node x) with the learned one. Scrolling leaves that unchanged, so the
+    // mapping stays frozen there; a translation moves every view by the same
+    // delta; a zoom change rescales them, caught by the width check and left
+    // to the y re-learn below. The shift is applied to the offset directly,
+    // never by re-learning zoom from whatever layouts are current: a
+    // vertically clipped view would otherwise move every host by its clipped y.
+    QVector<QPair<double, double>> shifts;
+    for (int i = 0; i < count; ++i) {
+        const auto layout = lastLayout.find(nodes[i].win);
+        if (layout == lastLayout.end() || now - layout->when > 200 || !layoutUsable(*layout, now))
+            continue;
+        if (!managerWhen)
+            break; // no mapping learned yet; the block below learns it
+        const int width = layout->x2 - layout->x1;
+        auto seenWidth = lastLayoutW.find(nodes[i].win);
+        if (seenWidth == lastLayoutW.end()) {
+            lastLayoutW.insert(nodes[i].win, width);
+            continue;
+        }
+        if (qAbs(seenWidth.value() - width) > 1) {
+            *seenWidth = width; // zoom change, not a translation
+            continue;
+        }
+        const double dx = double(layout->x1) - managerZoom * double(nodes[i].rect.x1) - managerOffsetX;
+        const double dy = double(layout->y1) - managerZoom * double(nodes[i].rect.y1) - managerOffsetY;
+        if (qAbs(dx) > 3.0 || qAbs(dy) > 3.0)
+            shifts.append({dx, dy});
+    }
+    double shiftX = 0.0, shiftY = 0.0;
+    int agreeing = 0;
+    if (!shifts.isEmpty()) {
+        QVector<double> xs, ys;
+        for (const QPair<double, double> &s : shifts) {
+            xs.append(s.first);
+            ys.append(s.second);
+        }
+        std::sort(xs.begin(), xs.end());
+        std::sort(ys.begin(), ys.end());
+        shiftX = xs.at(xs.size() / 2);
+        shiftY = ys.at(ys.size() / 2);
+        for (const QPair<double, double> &s : shifts)
+            if (qAbs(s.first - shiftX) <= 2.0 && qAbs(s.second - shiftY) <= 2.0)
+                ++agreeing;
+    }
+    if (agreeing >= 2
+        || (agreeing == 1 && originShiftPasses >= 1 && qAbs(shiftX - pendingShiftX) <= 2.0
+            && qAbs(shiftY - pendingShiftY) <= 2.0)) {
+        managerOffsetX += shiftX;
+        managerOffsetY += shiftY;
+        lastPlacement.clear();
+        originShiftPasses = 0;
+        menufixTrace("maxviews: chain moved, offset by %d,%d\n", int(shiftX), int(shiftY));
+    } else if (agreeing) {
+        pendingShiftX = shiftX;
+        pendingShiftY = shiftY;
+        ++originShiftPasses;
+    } else {
+        originShiftPasses = 0;
+    }
+
     // The chain viewport's right edge follows the Live window's right edge.
     // A fullscreen/narrow change otherwise leaves the old bound in place and
     // hides every Max host, because they are suddenly outside it.
     if (maxDeviceParent) {
         XWindowAttributes parentAttrs;
         if (XGetWindowAttributes(dpy, maxDeviceParent, &parentAttrs)) {
+            const qreal dpr = qApp ? qApp->devicePixelRatio() : 1.0;
+            const int windowUnits = qRound(double(parentAttrs.width) / dpr);
+            lastWindowUnits = windowUnits;
             if (viewportRightUpdated) {
                 viewportRightUpdated = false;
                 viewportParentWidth = parentAttrs.width;
             } else if (viewportParentWidth && parentAttrs.width != viewportParentWidth) {
-                const qreal dpr = qApp ? qApp->devicePixelRatio() : 1.0;
-                viewportRight += qRound(double(parentAttrs.width - viewportParentWidth) / dpr);
+                // A window resize keeps the side panel's width: the chain ends
+                // that many units before the window. Without a learned inset,
+                // start from the window edge; it only costs the frame the
+                // resize happens on, never the whole chain.
+                viewportRight = viewportPanelUnits >= 0 ? windowUnits - viewportPanelUnits : windowUnits - 9;
                 viewportParentWidth = parentAttrs.width;
                 nudgedHosts.clear();
                 lastPlacement.clear();
@@ -670,8 +790,13 @@ void manageMaxDeviceViews()
                 viewportParentWidth = parentAttrs.width;
             }
             if (viewportRightWhen == 0) {
-                const qreal dpr = qApp ? qApp->devicePixelRatio() : 1.0;
-                viewportRight = qRound(double(parentAttrs.width) / dpr) - 9;
+                viewportRight = windowUnits - 9;
+                static qint64 lastFallback = 0;
+                if (now - lastFallback > 1000) {
+                    lastFallback = now;
+                    menufixTrace("maxviews: fallback width %d dpr ", parentAttrs.width);
+                    menufixTrace("%d/1000 right %d\n", int(dpr * 1000), viewportRight);
+                }
             }
         }
     }
@@ -744,6 +869,21 @@ void manageMaxDeviceViews()
 
     const int left = viewportLeft;
     const int right = viewportRight > viewportLeft ? viewportRight : 2469;
+    {
+        static qint64 lastSnapshot = 0;
+        if (now - lastSnapshot > 1000) {
+            lastSnapshot = now;
+            menufixTrace("maxviews: boundary %d..%d x ", left, right);
+            menufixTrace("%d..%d zoom ", viewportTop, viewportBottom);
+            menufixTrace("%d/1000 off %d\n", int(managerZoom * 1000), int(managerOffsetX));
+            for (int i = 0; i < count && i < 8; ++i) {
+                menufixTrace("maxviews: view %x node ", int(nodes[i].win));
+                menufixTrace("%d..%d screen ", nodes[i].rect.x1, nodes[i].rect.x2);
+                menufixTrace("%d..%d\n", qRound(managerZoom * nodes[i].rect.x1 + managerOffsetX),
+                             qRound(managerZoom * nodes[i].rect.x2 + managerOffsetX));
+            }
+        }
+    }
     const int top = viewportTop;
     const int bottom = viewportBottom;
     // At 100 % the chain has no vertical scroll: the node y is the screen y.
@@ -791,10 +931,11 @@ void manageMaxDeviceViews()
             // offset content for clipping.
             if (checkContent && ix1 == sx1 && iy1 == sy1 && ix2 == sx2 && iy2 == sy2)
                 repairMaxContent(dpy, nodes[i].win);
-            // A host that just became fully visible (or was created while
-            // visible) needs one configure event to make the runtime paint.
-            if (ix1 == sx1 && iy1 == sy1 && ix2 == sx2 && iy2 == sy2
-                && !nudgedHosts.contains(nodes[i].win)) {
+            // A host that has just become visible (fully or clipped at the
+            // chain's edge) needs one configure event to make the runtime
+            // paint; otherwise Live's placeholder stays grey until the view is
+            // scrolled away and back.
+            if (!nudgedHosts.contains(nodes[i].win)) {
                 if (nudgeMaxContent(dpy, nodes[i].win))
                     nudgedHosts.insert(nodes[i].win);
             }
@@ -1112,6 +1253,7 @@ extern "C" int XDestroyWindow(Display *dpy, Window w)
     lastLayout.remove((unsigned long)w);
     lastPlacement.remove((unsigned long)w);
     nudgedHosts.remove((unsigned long)w);
+    lastLayoutW.remove((unsigned long)w);
     return real(dpy, w);
 }
 
