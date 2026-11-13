@@ -610,8 +610,11 @@ bool nudgeMaxContent(Display *dpy, Window host)
     if (!content || width <= 1 || height <= 1)
         return false;
     // Keep the content where the runtime put it: a view clipped at the chain
-    // edge carries an offset that must survive the nudge.
-    XMoveResizeWindow(dpy, content, contentX, contentY, unsigned(width - 1), unsigned(height));
+    // edge carries an offset that must survive the nudge. Grow by one pixel
+    // rather than shrink: the transient column then falls outside the host and
+    // is clipped, whereas shrinking left its outer column unpainted and showed
+    // as a hairline at the device's edge.
+    XMoveResizeWindow(dpy, content, contentX, contentY, unsigned(width + 1), unsigned(height));
     XSync(dpy, False);
     XMoveResizeWindow(dpy, content, contentX, contentY, unsigned(width), unsigned(height));
     XFlush(dpy);
@@ -929,9 +932,16 @@ void manageMaxDeviceViews()
         // until the next refresh.
         const int fullWidth = sx2 - sx1;
         const int fullHeight = sy2 - sy1;
-        const bool mostlyOut = fullWidth <= 0 || fullHeight <= 0
-            || (ix2 - ix1) * 5 < fullWidth || (iy2 - iy1) * 5 < fullHeight;
-        if (ix1 >= ix2 || iy1 >= iy2 || mostlyOut) {
+        // Hide only when nothing of the view is inside the chain. Live's layout
+        // routine already sizes a host to its visible rect, so a partially
+        // visible view shows exactly its visible part, frame and view together.
+        // The old "less than a fifth" rule existed for when placement was not
+        // trustworthy; it left an empty frame strip at the edge.
+        // A few pixels are a hairline, not a partial view: hiding them keeps
+        // the frame edge from showing a 1 px seam next to its neighbour.
+        const bool nothingVisible = fullWidth <= 0 || fullHeight <= 0
+            || ix2 - ix1 <= 3 || iy2 - iy1 <= 3;
+        if (nothingVisible) {
             managerHidden.insert(nodes[i].win);
             XUnmapWindow(dpy, nodes[i].win);
             lastPlacement.remove(nodes[i].win);
