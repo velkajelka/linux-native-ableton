@@ -61,8 +61,6 @@
 #include <QVector>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
-#include <climits>
-#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -117,6 +115,8 @@ namespace {
 // (Clip view) - Live itself never hides them for that case, but it does hide
 // them when a track's devices change, so unmapping is a state it handles.
 QSet<Window> maxDeviceViews;
+Window maxDeviceParent = 0; // Live's window, parent of the Max device hosts
+bool contentCheckRequested = false; // reconcile the Max content after a layout
 bool maxDeviceViewsHidden;
 
 bool managerEnabled()
@@ -184,22 +184,31 @@ struct AddressRanges {
         const quintptr a = reinterpret_cast<quintptr>(p);
         if (!a || a + len < a)
             return false;
-        for (int i = 0; i < starts.size(); ++i) {
-            if (a >= starts.at(i) && a + len <= ends.at(i))
-                return true;
+        // The mappings are sorted by start and do not overlap.
+        int lo = 0, hi = starts.size() - 1;
+        while (lo <= hi) {
+            const int mid = lo + (hi - lo) / 2;
+            if (a < starts.at(mid))
+                hi = mid - 1;
+            else if (a >= ends.at(mid))
+                lo = mid + 1;
+            else
+                return a + len <= ends.at(mid);
         }
         return false;
     }
 };
 
 struct LayoutInfo {
-    int x1, y1, x2, y2;
+    int x1, y1, x2, y2;     // full (unclipped) rect, Live's units
+    int vx1, vy1, vx2, vy2; // visible (clipped) rect
     qint64 when;
 };
 QHash<unsigned long, LayoutInfo> lastLayout; // full rect per host, from Live
 void *chainView = nullptr;                   // the chain view object
 int viewportLeft = 8;
 int viewportRight = 2469;
+qint64 viewportRightWhen = 0;
 int viewportTop = 1446;
 int viewportBottom = 1615;
 // Live's UI zoom is a scale between the chain view's node rectangles and the
@@ -218,11 +227,15 @@ void hookedLayout(void *window, const int *visible, const int *full)
 {
     if (visible && full) {
         const qint64 now = monotonicMs();
-        lastLayout[(unsigned long)window] = {full[0], full[1], full[2], full[3], now};
+        lastLayout[(unsigned long)window] = {full[0],    full[1],    full[2],    full[3],
+                                             visible[0], visible[1], visible[2], visible[3],
+                                             now};
         if (visible[0] > full[0])
             viewportLeft = visible[0];
-        if (visible[2] < full[2])
+        if (visible[2] < full[2]) {
             viewportRight = visible[2];
+            viewportRightWhen = now;
+        }
         viewportTop = full[1];
         viewportBottom = full[3];
     }
@@ -239,9 +252,43 @@ ViewRectFn viewRectFn;
 using ChainLayoutFn = void (*)(void *, void *, void *);
 ChainLayoutFn originalChainLayout;
 
+Display *managerDisplay()
+{
+    static Display *dpy = XOpenDisplay(nullptr);
+    return dpy;
+}
+
 void hookedChainLayout(void *self, void *arg2, void *arg3)
 {
     chainView = self;
+    if (self) {
+        // Register the device hosts before Live lays them out. XMoveResizeWindow
+        // uses this set to scale Live's units to pixels even when a device is
+        // small enough that its height no longer identifies it.
+        static void *parentFor = nullptr;
+        if (self != parentFor) {
+            parentFor = self;
+            maxDeviceParent = 0;
+        }
+        void *node = *reinterpret_cast<void **>(static_cast<char *>(self) + 0x28);
+        for (int i = 0; node && i < 128; ++i) {
+            const unsigned long win = *reinterpret_cast<unsigned long *>(static_cast<char *>(node) + 0x10);
+            if (win) {
+                maxDeviceViews.insert(win);
+                if (!maxDeviceParent) {
+                    Window root, parent, *children = nullptr;
+                    unsigned count = 0;
+                    if (Display *dpy = managerDisplay();
+                        dpy && XQueryTree(dpy, win, &root, &parent, &children, &count))
+                        maxDeviceParent = parent;
+                    if (children)
+                        XFree(children);
+                }
+            }
+            node = *reinterpret_cast<void **>(node);
+        }
+        contentCheckRequested = true;
+    }
     if (originalChainLayout)
         originalChainLayout(self, arg2, arg3);
 }
@@ -338,16 +385,19 @@ constexpr size_t kNodeSize = 0x18;
 // The view rect getter reads +0x30, +0x38 and follows its +0x60 list.
 constexpr size_t kViewSize = 0x68;
 
-// The getter walks the view's +0x60 list on its own. Checking the first hop
-// is enough to reject a stale view; a live view's list is Live's invariant
-// (Live calls the same getter on it), and walking the whole list here would
-// reject the large UIs that legitimately have long lists.
+// The getter walks the view's +0x60 list without checking anything. Walk the
+// same list here first so a stale or corrupt view cannot send the getter into
+// unmapped memory. Real chains are a few dozen nodes; the cap only stops a
+// cycle.
 bool viewLooksValid(const void *view, const AddressRanges &ranges)
 {
-    if (!ranges.contains(view, kViewSize))
-        return false;
-    const void *next = *reinterpret_cast<void *const *>(static_cast<const char *>(view) + 0x60);
-    return !next || ranges.contains(next, kViewSize);
+    const void *node = view;
+    for (int i = 0; node && i < 4096; ++i) {
+        if (!ranges.contains(node, kViewSize))
+            return false;
+        node = *reinterpret_cast<void *const *>(static_cast<const char *>(node) + 0x60);
+    }
+    return !node;
 }
 
 bool plausibleRect(const MaxViewRect &r)
@@ -408,6 +458,61 @@ void installChainViewHook()
     menufixTrace("maxviews: chain hook %d\n", int(bool(originalChainLayout)));
 }
 
+// Live sometimes leaves the Max runtime's content window at the size of an
+// older zoom: the host is correct but the content is either smaller than the
+// host (black border) or larger (clipped). When a device is fully visible the
+// content should fill its host, so put it back if it does not.
+void repairMaxContent(Display *dpy, Window host)
+{
+    if (!maxDeviceViews.contains(host))
+        return; // destroyed or no longer one of ours
+    Window root, parent, *children = nullptr;
+    unsigned count = 0;
+    if (!XQueryTree(dpy, host, &root, &parent, &children, &count))
+        return;
+    Window content = 0;
+    int contentWidth = 0, contentHeight = 0, contentX = 0, contentY = 0;
+    long bestArea = -1;
+    for (unsigned i = 0; i < count; ++i) {
+        XWindowAttributes attrs;
+        if (!XGetWindowAttributes(dpy, children[i], &attrs))
+            continue;
+        const long area = long(attrs.width) * attrs.height;
+        if (area > bestArea) {
+            bestArea = area;
+            content = children[i];
+            contentWidth = attrs.width;
+            contentHeight = attrs.height;
+            contentX = attrs.x;
+            contentY = attrs.y;
+        }
+    }
+    XWindowAttributes hostAttrs;
+    if (content && XGetWindowAttributes(dpy, host, &hostAttrs)
+        && hostAttrs.width > 0 && hostAttrs.height > 0
+        && (contentWidth != hostAttrs.width || contentHeight != hostAttrs.height
+            || contentX != 0 || contentY != 0)) {
+        XMoveResizeWindow(dpy, content, 0, 0, unsigned(hostAttrs.width), unsigned(hostAttrs.height));
+    }
+    if (children)
+        XFree(children);
+}
+
+// A view Live placed at the chain's edge because it is (or was) out of view
+// can carry a clamped full rect: x1 is the viewport edge, not the device's
+// true screen position. Only a rect whose visible part starts at its full
+// left edge is a reliable reference for the zoom and offset.
+bool layoutUsable(const LayoutInfo &l, qint64 now)
+{
+    if (l.vx2 <= l.vx1 || l.vx1 != l.x1 || l.x2 <= viewportLeft)
+        return false;
+    // A recent right edge catches a view Live clamped to the edge; an old one
+    // may belong to an earlier window size and must not reject valid views.
+    if (now - viewportRightWhen < 5000 && l.x1 >= viewportRight)
+        return false;
+    return true;
+}
+
 // Keeps every Max device view on its device. Live gives us the unclipped
 // device rect through the chain view's list (viewRectFn); the mapping from
 // that rect to the layout routine's units, screen = zoom * node + offset,
@@ -420,7 +525,7 @@ void manageMaxDeviceViews()
         return;
     if (!chainView || !viewRectFn || !originalLayout)
         return;
-    static Display *dpy = XOpenDisplay(nullptr);
+    Display *dpy = managerDisplay();
     if (!dpy)
         return;
 
@@ -498,7 +603,8 @@ void manageMaxDeviceViews()
     qint64 newest = -1;
     for (int i = 0; i < count; ++i) {
         auto it = lastLayout.find(nodes[i].win);
-        if (it != lastLayout.end() && now - it->when < 5000 && it->when > newest)
+        if (it != lastLayout.end() && now - it->when < 5000 && layoutUsable(*it, now)
+            && it->when > newest)
             newest = it->when;
     }
     if (newest < 0) {
@@ -511,7 +617,8 @@ void manageMaxDeviceViews()
         double fullWidth = 0.0, nodeWidth = 0.0;
         for (int i = 0; i < count; ++i) {
             auto it = lastLayout.find(nodes[i].win);
-            if (it == lastLayout.end() || newest - it->when > 5 || now - it->when >= 5000)
+            if (it == lastLayout.end() || newest - it->when > 5 || now - it->when >= 5000
+                || !layoutUsable(*it, now))
                 continue;
             const double nw = double(nodes[i].rect.x2 - nodes[i].rect.x1);
             if (nw >= 20.0) {
@@ -530,7 +637,8 @@ void manageMaxDeviceViews()
         int fits = 0;
         for (int i = 0; i < count; ++i) {
             auto it = lastLayout.find(nodes[i].win);
-            if (it == lastLayout.end() || newest - it->when > 5 || now - it->when >= 5000)
+            if (it == lastLayout.end() || newest - it->when > 5 || now - it->when >= 5000
+                || !layoutUsable(*it, now))
                 continue;
             offsetX += double(it->x1) - managerZoom * double(nodes[i].rect.x1);
             offsetY += double(it->y1) - managerZoom * double(nodes[i].rect.y1);
@@ -541,6 +649,15 @@ void manageMaxDeviceViews()
             managerOffsetY = offsetY / fits;
         }
         managerWhen = now;
+    }
+
+    // Reconcile the Max runtime's content window after a layout (startup,
+    // track change, zoom change), and periodically in case it resizes itself.
+    static qint64 lastContentCheck = 0;
+    const bool checkContent = contentCheckRequested || now - lastContentCheck >= 1000;
+    if (checkContent) {
+        contentCheckRequested = false;
+        lastContentCheck = now;
     }
 
     const int left = viewportLeft;
@@ -562,6 +679,11 @@ void manageMaxDeviceViews()
             int visible[4] = {ix1, iy1, ix2, iy2};
             int full[4] = {sx1, sy1, sx2, sy2};
             originalLayout(reinterpret_cast<void *>(nodes[i].win), visible, full);
+            // A device that is not clipped should have its content filling the
+            // host exactly. Partially visible devices keep Live's larger,
+            // offset content for clipping.
+            if (checkContent && ix1 == sx1 && iy1 == sy1 && ix2 == sx2 && iy2 == sy2)
+                repairMaxContent(dpy, nodes[i].win);
         }
     }
     XFlush(dpy);
@@ -601,12 +723,6 @@ bool calledFromLive(void *ret)
         },
         &liveBase);
     return reinterpret_cast<uintptr_t>(info.dli_fbase) == liveBase;
-}
-
-const char *moduleOf(void *address)
-{
-    Dl_info info;
-    return dladdr(address, &info) && info.dli_fname ? info.dli_fname : "?";
 }
 
 // The Max runtime (libMaxPlugLib.so) draws its UI at JUCE's own scale, which on
@@ -787,17 +903,32 @@ extern "C" int XMoveResizeWindow(Display *dpy, Window w, int x, int y, unsigned 
     // needs pixels: unscaled, every Max device sat above and left of its slot
     // by (ratio - 1) times its position. followMaxRuntimeScale() puts the
     // runtime's own scale at Live's, so its painting fills the scaled window.
-    if (!windowProps.contains(w) && height >= 100) {
-        maxDeviceViews.insert(w);
+    if (!windowProps.contains(w)) {
         // With the runtime at Live's scale, its own window requests are
         // already in pixels; only Live's are in its unscaled units.
         const bool liveUnits = calledFromLive(__builtin_return_address(0));
-        if (const qreal ratio = qApp ? qApp->devicePixelRatio() : 1.0;
-            liveUnits && ratio != 1.0) {
-            x = qRound(x * ratio);
-            y = qRound(y * ratio);
-            width = unsigned(qRound(width * ratio));
-            height = unsigned(qRound(height * ratio));
+        // Height identifies a Max view at normal zoom, but a low enough zoom
+        // shrinks the device below that threshold. The chain view's node list
+        // is authoritative; the parent check covers a window Live lays out
+        // before the chain hook has registered it.
+        bool maxView = height >= 100 || maxDeviceViews.contains(w);
+        if (!maxView && liveUnits && maxDeviceParent) {
+            Window root, parent, *children = nullptr;
+            unsigned count = 0;
+            if (XQueryTree(dpy, w, &root, &parent, &children, &count))
+                maxView = parent == maxDeviceParent;
+            if (children)
+                XFree(children);
+        }
+        if (maxView) {
+            maxDeviceViews.insert(w);
+            if (const qreal ratio = qApp ? qApp->devicePixelRatio() : 1.0;
+                liveUnits && ratio != 1.0) {
+                x = qRound(x * ratio);
+                y = qRound(y * ratio);
+                width = unsigned(qRound(width * ratio));
+                height = unsigned(qRound(height * ratio));
+            }
         }
     }
     if (!windowProps.contains(w))
