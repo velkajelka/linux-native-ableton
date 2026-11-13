@@ -121,6 +121,7 @@ bool calledFromLive(void *ret);
 // them when a track's devices change, so unmapping is a state it handles.
 QSet<Window> maxDeviceViews;
 Window maxDeviceParent = 0; // Live's window, parent of the Max device hosts
+Display *managerDisplay(); // defined below
 bool contentCheckRequested = false; // reconcile the Max content after a layout
 bool maxDeviceViewsHidden;
 
@@ -214,7 +215,8 @@ void *chainView = nullptr;                   // the chain view object
 int viewportLeft = 8;
 int viewportRight = 2469;
 int viewportParentWidth = 0;    // Live window width when the right edge was learned
-int viewportPanelUnits = -1;    // window right minus chain right (side panel), units
+int viewportPanelUnits = -1;
+int viewportClipWidth = 0;  // window width, px, when the right edge was clipped    // window right minus chain right (side panel), units
 double lastWindowUnits = 0.0;   // window width in chain units, as of the last pass
 double pendingPanelUnits = -1.0;
 int panelAgreements = 0;
@@ -283,13 +285,31 @@ void hookedLayout(void *window, const int *visible, const int *full)
             // Only a clip that implies a plausible side panel is the chain's
             // edge; a view Live clamped during a transition reports a point or
             // its own position and must not shrink the viewport.
-            const bool plausible = lastWindowUnits <= 0.0
-                || (lastWindowUnits - double(visible[2]) >= 0.0
-                    && lastWindowUnits - double(visible[2]) < lastWindowUnits / 3.0);
+            // The window size to judge against is the live one, not the value
+            // from the last pass: Live starts at 800 px and is then made
+            // fullscreen, and a layout computed before that can arrive after
+            // it. Judged against the stale width, the startup clamp looked
+            // plausible and pinned the chain for the whole session.
+            const qreal dpr = qApp ? qApp->devicePixelRatio() : 1.0;
+            double windowUnits = lastWindowUnits;
+            int clipWidth = 0;
+            if (maxDeviceParent && dpr > 0.0) {
+                if (Display *mgr = managerDisplay()) {
+                    XWindowAttributes attrs;
+                    if (XGetWindowAttributes(mgr, maxDeviceParent, &attrs)) {
+                        windowUnits = double(attrs.width) / dpr;
+                        clipWidth = attrs.width;
+                    }
+                }
+            }
+            const bool plausible = windowUnits <= 0.0
+                || (windowUnits - double(visible[2]) >= 0.0
+                    && windowUnits - double(visible[2]) < windowUnits / 3.0);
             if (plausible) {
             viewportRight = visible[2];
             viewportRightWhen = now;
             viewportRightUpdated = true;
+            viewportClipWidth = clipWidth;
             // The side panel's width is learned as an inset from the window,
             // measured against the window size in effect during this clip. A
             // single clip can be a transient clamp (Live's 800 px startup
@@ -801,6 +821,15 @@ void manageMaxDeviceViews()
             lastWindowUnits = windowUnits;
             if (viewportRightUpdated) {
                 viewportRightUpdated = false;
+                if (viewportClipWidth > 0 && viewportClipWidth != parentAttrs.width) {
+                    // The clip was measured against another window size (Live's
+                    // 800 px startup window, before it was made fullscreen).
+                    // Move its edge by the width difference so it belongs to the
+                    // window we have now, instead of pinning the chain at the
+                    // startup width for the whole session.
+                    viewportRight += qRound(double(parentAttrs.width - viewportClipWidth) / dpr);
+                    viewportRightWhen = 0;
+                }
                 viewportParentWidth = parentAttrs.width;
             } else if (viewportParentWidth && parentAttrs.width != viewportParentWidth) {
                 // A window resize keeps the side panel's width: the chain ends
