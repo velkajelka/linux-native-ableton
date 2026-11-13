@@ -208,6 +208,8 @@ QHash<unsigned long, LayoutInfo> lastLayout; // full rect per host, from Live
 void *chainView = nullptr;                   // the chain view object
 int viewportLeft = 8;
 int viewportRight = 2469;
+int viewportParentWidth = 0;    // Live window width when the right edge was learned
+bool viewportRightUpdated = false;
 qint64 viewportRightWhen = 0;
 int viewportTop = 1446;
 int viewportBottom = 1615;
@@ -218,7 +220,15 @@ double managerZoom = 1.0;
 double managerOffsetX = 0.0;
 double managerOffsetY = 0.0;
 qint64 managerWhen = 0;
+int mappingNodeY = 0;
 QSet<Window> managerHidden;
+
+struct Placement {
+    int vx1, vy1, vx2, vy2;
+    int fx1, fy1, fx2, fy2;
+};
+QHash<unsigned long, Placement> lastPlacement;
+QSet<unsigned long> nudgedHosts;
 
 using LayoutFn = void (*)(void *, const int *, const int *);
 LayoutFn originalLayout;
@@ -235,6 +245,7 @@ void hookedLayout(void *window, const int *visible, const int *full)
         if (visible[2] < full[2]) {
             viewportRight = visible[2];
             viewportRightWhen = now;
+            viewportRightUpdated = true;
         }
         viewportTop = full[1];
         viewportBottom = full[3];
@@ -498,13 +509,52 @@ void repairMaxContent(Display *dpy, Window host)
         XFree(children);
 }
 
+// The Max runtime can leave the content unpainted when a hidden host is
+// shown again (for example after a fullscreen change). A one-pixel resize and
+// restore sends the configure event it needs, once per visibility change,
+// without recurring layout calls.
+bool nudgeMaxContent(Display *dpy, Window host)
+{
+    if (!maxDeviceViews.contains(host))
+        return false;
+    Window root, parent, *children = nullptr;
+    unsigned count = 0;
+    if (!XQueryTree(dpy, host, &root, &parent, &children, &count))
+        return false;
+    Window content = 0;
+    int width = 0, height = 0;
+    long bestArea = -1;
+    for (unsigned i = 0; i < count; ++i) {
+        XWindowAttributes attrs;
+        if (!XGetWindowAttributes(dpy, children[i], &attrs))
+            continue;
+        const long area = long(attrs.width) * attrs.height;
+        if (area > bestArea) {
+            bestArea = area;
+            content = children[i];
+            width = attrs.width;
+            height = attrs.height;
+        }
+    }
+    if (children)
+        XFree(children);
+    if (!content || width <= 1 || height <= 1)
+        return false;
+    XMoveResizeWindow(dpy, content, 0, 0, unsigned(width - 1), unsigned(height));
+    XSync(dpy, False);
+    XMoveResizeWindow(dpy, content, 0, 0, unsigned(width), unsigned(height));
+    XFlush(dpy);
+    return true;
+}
+
 // A view Live placed at the chain's edge because it is (or was) out of view
 // can carry a clamped full rect: x1 is the viewport edge, not the device's
 // true screen position. Only a rect whose visible part starts at its full
 // left edge is a reliable reference for the zoom and offset.
 bool layoutUsable(const LayoutInfo &l, qint64 now)
 {
-    if (l.vx2 <= l.vx1 || l.vx1 != l.x1 || l.x2 <= viewportLeft)
+    if (l.vx2 <= l.vx1 || l.vx1 != l.x1 || l.x2 <= viewportLeft
+        || l.vy2 <= viewportTop || l.vy1 >= viewportBottom)
         return false;
     // A recent right edge catches a view Live clamped to the edge; an old one
     // may belong to an earlier window size and must not reject valid views.
@@ -600,6 +650,32 @@ void manageMaxDeviceViews()
     }
 
     const qint64 now = monotonicMs();
+
+    // The chain viewport's right edge follows the Live window's right edge.
+    // A fullscreen/narrow change otherwise leaves the old bound in place and
+    // hides every Max host, because they are suddenly outside it.
+    if (maxDeviceParent) {
+        XWindowAttributes parentAttrs;
+        if (XGetWindowAttributes(dpy, maxDeviceParent, &parentAttrs)) {
+            if (viewportRightUpdated) {
+                viewportRightUpdated = false;
+                viewportParentWidth = parentAttrs.width;
+            } else if (viewportParentWidth && parentAttrs.width != viewportParentWidth) {
+                const qreal dpr = qApp ? qApp->devicePixelRatio() : 1.0;
+                viewportRight += qRound(double(parentAttrs.width - viewportParentWidth) / dpr);
+                viewportParentWidth = parentAttrs.width;
+                nudgedHosts.clear();
+                lastPlacement.clear();
+            } else {
+                viewportParentWidth = parentAttrs.width;
+            }
+            if (viewportRightWhen == 0) {
+                const qreal dpr = qApp ? qApp->devicePixelRatio() : 1.0;
+                viewportRight = qRound(double(parentAttrs.width) / dpr) - 9;
+            }
+        }
+    }
+
     qint64 newest = -1;
     for (int i = 0; i < count; ++i) {
         auto it = lastLayout.find(nodes[i].win);
@@ -607,10 +683,13 @@ void manageMaxDeviceViews()
             && it->when > newest)
             newest = it->when;
     }
-    if (newest < 0) {
-        if (!(managerWhen && now - managerWhen < 5000))
-            return; // no fresh layout and nothing cached
-    } else {
+    if (managerWhen && qAbs(nodes[0].rect.y1 - mappingNodeY) > 2) {
+        managerWhen = 0; // zoom/window/detail-area change
+        lastPlacement.clear();
+    }
+    if (!managerWhen) {
+        if (newest < 0)
+            return; // no trusted layout for the first/zoom mapping
         // Live's zoom scales the device width between the chain view's node
         // rect and the rect the layout routine expects. The unclipped width
         // of a view Live just laid out gives that scale directly.
@@ -649,12 +728,15 @@ void manageMaxDeviceViews()
             managerOffsetY = offsetY / fits;
         }
         managerWhen = now;
+        mappingNodeY = nodes[0].rect.y1;
     }
 
     // Reconcile the Max runtime's content window after a layout (startup,
     // track change, zoom change), and periodically in case it resizes itself.
+    // Time-based only: animations trigger chain layouts, and reacting to every
+    // one made the content repair fight the runtime.
     static qint64 lastContentCheck = 0;
-    const bool checkContent = contentCheckRequested || now - lastContentCheck >= 1000;
+    const bool checkContent = now - lastContentCheck >= 1000;
     if (checkContent) {
         contentCheckRequested = false;
         lastContentCheck = now;
@@ -664,26 +746,58 @@ void manageMaxDeviceViews()
     const int right = viewportRight > viewportLeft ? viewportRight : 2469;
     const int top = viewportTop;
     const int bottom = viewportBottom;
+    // At 100 % the chain has no vertical scroll: the node y is the screen y.
+    // A stale vertical offset here previously hid every host after a window
+    // or fullscreen change.
+    const double offsetY = qAbs(managerZoom - 1.0) < 0.05 ? 0.0 : managerOffsetY;
     for (int i = 0; i < count; ++i) {
         const int sx1 = qRound(managerZoom * nodes[i].rect.x1 + managerOffsetX);
-        const int sy1 = qRound(managerZoom * nodes[i].rect.y1 + managerOffsetY);
+        const int sy1 = qRound(managerZoom * nodes[i].rect.y1 + offsetY);
         const int sx2 = qRound(managerZoom * nodes[i].rect.x2 + managerOffsetX);
-        const int sy2 = qRound(managerZoom * nodes[i].rect.y2 + managerOffsetY);
+        const int sy2 = qRound(managerZoom * nodes[i].rect.y2 + offsetY);
         const int ix1 = qMax(sx1, left), iy1 = qMax(sy1, top);
         const int ix2 = qMin(sx2, right), iy2 = qMin(sy2, bottom);
-        if (ix1 >= ix2 || iy1 >= iy2) {
+        // A view Live clipped at the viewport edge is not a valid thing to
+        // show: it leaves a sliver of the Max UI over whatever is at the
+        // edge. Hide it once less than a fifth of the device is visible,
+        // as the old scroll heuristic did, instead of showing the sliver
+        // until the next refresh.
+        const int fullWidth = sx2 - sx1;
+        const int fullHeight = sy2 - sy1;
+        const bool mostlyOut = fullWidth <= 0 || fullHeight <= 0
+            || (ix2 - ix1) * 5 < fullWidth || (iy2 - iy1) * 5 < fullHeight;
+        if (ix1 >= ix2 || iy1 >= iy2 || mostlyOut) {
             managerHidden.insert(nodes[i].win);
             XUnmapWindow(dpy, nodes[i].win);
+            lastPlacement.remove(nodes[i].win);
+            nudgedHosts.remove(nodes[i].win);
         } else {
             managerHidden.remove(nodes[i].win);
             int visible[4] = {ix1, iy1, ix2, iy2};
             int full[4] = {sx1, sy1, sx2, sy2};
-            originalLayout(reinterpret_cast<void *>(nodes[i].win), visible, full);
+            const Placement placement = {ix1, iy1, ix2, iy2, sx1, sy1, sx2, sy2};
+            const auto placed = lastPlacement.constFind(nodes[i].win);
+            const bool needLayout = placed == lastPlacement.constEnd()
+                || placed->vx1 != ix1 || placed->vy1 != iy1
+                || placed->vx2 != ix2 || placed->vy2 != iy2
+                || placed->fx1 != sx1 || placed->fy1 != sy1
+                || placed->fx2 != sx2 || placed->fy2 != sy2;
+            if (needLayout) {
+                originalLayout(reinterpret_cast<void *>(nodes[i].win), visible, full);
+                lastPlacement.insert(nodes[i].win, placement);
+            }
             // A device that is not clipped should have its content filling the
             // host exactly. Partially visible devices keep Live's larger,
             // offset content for clipping.
             if (checkContent && ix1 == sx1 && iy1 == sy1 && ix2 == sx2 && iy2 == sy2)
                 repairMaxContent(dpy, nodes[i].win);
+            // A host that just became fully visible (or was created while
+            // visible) needs one configure event to make the runtime paint.
+            if (ix1 == sx1 && iy1 == sy1 && ix2 == sx2 && iy2 == sy2
+                && !nudgedHosts.contains(nodes[i].win)) {
+                if (nudgeMaxContent(dpy, nodes[i].win))
+                    nudgedHosts.insert(nodes[i].win);
+            }
         }
     }
     XFlush(dpy);
@@ -996,6 +1110,8 @@ extern "C" int XDestroyWindow(Display *dpy, Window w)
     maxDeviceViews.remove(w);
     managerHidden.remove(w);
     lastLayout.remove((unsigned long)w);
+    lastPlacement.remove((unsigned long)w);
+    nudgedHosts.remove((unsigned long)w);
     return real(dpy, w);
 }
 
