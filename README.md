@@ -151,31 +151,47 @@ database — run it once and restart Live:
 Max for Live devices draw their interface in their own native windows. On
 Windows those windows are children of the device chain's window, so the OS
 clips them together with it. On Linux Live draws its whole interface in one
-window, and these views were children of it with nothing managing them, so the
-shim took that role: it places each view on its device's frame, follows Live's
-own detail-view state to hide and show them with the Clip and Device views, and
-gives the Max runtime Live's UI scale to draw at.
+window, and these views are children of it with nothing managing them, so the
+shim takes that role. A 30 Hz manager reads the device chain's own list of
+views and places each one on its device's frame; it hides the ones that are
+out of view.
+
+It follows the device chain through slow and fast scrolling, overview jumps,
+left/right arrow navigation, adding or removing effects, track switches,
+duplicated tracks and empty tracks. A view that scrolls out of the chain is
+hidden, including the slivers Live leaves at the viewport edge; a view that
+comes back appears over its device. This works at any UI zoom, including
+values below 60 % in Live's Preferences, and after resizing the window or
+switching between fullscreen and a narrow window. Animations and LFOs stay
+smooth because the manager only re-lays a view out when its rectangle
+actually changes.
 
 **Before:** at 125 % each view sat about 350 px above its device frame and
-filled only four fifths of it. Nothing hid the views when Clip view replaced
-the device view, so they stayed on screen over the piano roll, and they also
-stayed when the detail area was collapsed.
+filled only four fifths of it. Scrolling the chain could leave clipped slivers
+over other devices; clicking away could leave views over the wrong device; and
+a fullscreen-to-narrow change could blank or hide the rightmost views until
+they were scrolled away and back.
 
 **After:** the views sit exactly over their device's frame at any zoom and
-display scale, and fill it. They disappear whenever the detail area shows Clip
-view — and when it is collapsed — and come back with the Device view,
-whichever way you switch (the tabs, Shift+Tab, the View menu, or Alt+3 /
-Alt+4). They also follow Live's UI scale, including a change in Preferences
-while they are open.
+display scale, and fill it. They follow the chain while it scrolls, hide when
+their device leaves the viewport, and reappear over the device when it comes
+back. They disappear whenever the detail area shows Clip view — and when it
+is collapsed — and come back with the Device view, whichever way you switch
+(the tabs, Shift+Tab, the View menu, or Alt+3 / Alt+4). A view that becomes
+visible repaints immediately, including after a fullscreen change.
 
 All of it follows Live's own detail-view state, so there is nothing to
-configure. Two environment variables turn parts of it off for comparison:
-`LIVE_M4L_NOHIDE=1` keeps the views on screen in Clip view, and
-`LIVE_MAX_SCALE=0` leaves the Max runtime at its own scale.
+configure. Three environment variables turn parts of it off for comparison:
+
+| Variable | Effect |
+|---|---|
+| `LIVE_M4L_MANAGER=0` | Disable the Max-view manager; Live's native view placement and hiding apply. |
+| `LIVE_M4L_NOHIDE=1` | Keep the views on screen in Clip view. |
+| `LIVE_MAX_SCALE=0` | Leave the Max runtime at its own scale. |
 
 These hooks are written for Live 12.4.7 from the Push 3 image and check the
-build before using it; on another build they leave the windows untouched
-rather than guess.
+build before using it. On another build the manager stays inactive and the
+views use Live's native behavior rather than guess.
 
 <br>
 
@@ -229,7 +245,7 @@ Live finds plug-ins in the usual folders (`~/.vst3`, `/usr/lib/vst3`, `/usr/loca
 | Audio crackles, and Live's log fills with `State=XRUN` | Live's ring is shorter than one PipeWire cycle. The shim lifts it to cover the quantum automatically; if your quantum is unusual (above 1024 frames), either raise Live's buffer to match (`pw-metadata -n settings` shows the quantum) or set `LIVE_ALSA_MINRING` (see [Audio and PipeWire](#audio-and-pipewire)). |
 | A file dialog never appears and Live looks frozen (KDE on Wayland) | The desktop portal is a native Wayland client and cannot attach its dialog to Live's XWayland window. Wayland sessions use Qt's own dialogs for this reason; if a portal dialog still hangs, restart it with `systemctl --user restart plasma-xdg-desktop-portal-kde.service` and start Live again. `LIVE_NATIVE_DIALOGS=0` uses Live's own dialogs instead. |
 | Instruments, Audio Effects, MIDI Effects, Modulators or Max for Live are empty | Live's browser catalog was not completed, or Live rebuilt its database after it was. Quit Live, run `~/.local/share/ableton-live-12/tools/browser-catalog.py`, and start Live again (see [The browser's device categories](#the-browsers-device-categories)). |
-| Max for Live device views were misplaced, drawn small, or stayed over the piano roll | The shim's Max view hooks did not match this Live build. They were written for Live 12.4.7 from the Push 3 image and stayed inactive otherwise (see [Max for Live device views](#max-for-live-device-views)). |
+| Max for Live device views are misplaced, drawn small, stuck over other devices, or blank | The Max-view manager is inactive, or it did not recognize this Live build. It disables itself on a build whose layout, chain or rect-getter prologues do not match Live 12.4.7 from the Push 3 image; check that `LIVE_M4L_MANAGER` is not set to `0`. On a supported build, a view that becomes visible should repaint within a second; if it stays blank, note the window size and zoom when reporting it. |
 
 <br>
 
