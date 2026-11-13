@@ -225,6 +225,19 @@ int viewportBottom = 1615;
 // Live's UI zoom is a scale between the chain view's node rectangles and the
 // rectangles the layout routine works in. At 100 % zoom it is 1; at 105 % the
 // same device has a node width of 441 but a laid-out width of 463.
+// Chain right edge, as pixels from the window's right edge. Set once when a
+// side panel's width is known, it makes the boundary independent of which
+// clips Live happens to emit (and of the order they arrive in).
+int rightInsetPixels()
+{
+    static const int pixels = [] {
+        const char *value = getenv("LIVE_M4L_RIGHT_INSET");
+        const int n = value ? atoi(value) : 0;
+        return n > 0 ? n : -1;
+    }();
+    return pixels;
+}
+
 double managerZoom = 1.0;
 double managerOffsetX = 0.0;
 double managerOffsetY = 0.0;
@@ -265,7 +278,15 @@ void hookedLayout(void *window, const int *visible, const int *full)
         // view that is entirely outside reports a zero-width rect whose x is
         // its own clamped position, and taking that as the boundary made the
         // right edge unpredictable (and let hosts sit under the side panel).
-        if (visible[2] < full[2] && visible[2] > visible[0] && visible[3] > visible[1]) {
+        if (rightInsetPixels() <= 0 && visible[2] < full[2] && visible[2] > visible[0]
+            && visible[3] > visible[1]) {
+            // Only a clip that implies a plausible side panel is the chain's
+            // edge; a view Live clamped during a transition reports a point or
+            // its own position and must not shrink the viewport.
+            const bool plausible = lastWindowUnits <= 0.0
+                || (lastWindowUnits - double(visible[2]) >= 0.0
+                    && lastWindowUnits - double(visible[2]) < lastWindowUnits / 3.0);
+            if (plausible) {
             viewportRight = visible[2];
             viewportRightWhen = now;
             viewportRightUpdated = true;
@@ -287,6 +308,7 @@ void hookedLayout(void *window, const int *visible, const int *full)
                         panelAgreements = 1;
                     }
                 }
+            }
             }
             menufixTrace("maxviews: right from clip win %x vis ", int((unsigned long)window));
             menufixTrace("%d..%d full ", visible[0], visible[2]);
@@ -789,7 +811,10 @@ void manageMaxDeviceViews()
             } else {
                 viewportParentWidth = parentAttrs.width;
             }
-            if (viewportRightWhen == 0) {
+            if (rightInsetPixels() > 0) {
+                viewportRight = qRound((double(parentAttrs.width) - rightInsetPixels()) / dpr);
+                viewportRightWhen = 0;
+            } else if (viewportRightWhen == 0) {
                 viewportRight = windowUnits - 9;
                 static qint64 lastFallback = 0;
                 if (now - lastFallback > 1000) {
