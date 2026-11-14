@@ -1,0 +1,9 @@
+# Ableton's downloadable archives: the installer needs them, but they are
+# Ableton's content and must never enter the repository.
+Push3-RecoveryImage-*.zip
+ableton_live_suite_*.zip
+
+# Live logs and crash dumps picked up while developing next to the installer.
+install.log
+core
+core.*

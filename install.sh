@@ -78,7 +78,7 @@ export DEBUGFS_PAGER=__none__
 # --- terminal output ------------------------------------------------------------------
 # A numbered line per step, a progress bar under it while it runs, then the
 # time it took. Without a terminal (a log file) only the lines are written.
-STEPS=13
+STEPS=14
 STEP=0
 STEP_START=$SECONDS
 if [ -t 1 ]; then
@@ -421,6 +421,10 @@ fi
 step "Installing the shim and the launcher"
 mkdir -p "$PREFIX/shim" "$PREFIX/tools"
 cp "$MODS/shim/libmenufix.so" "$PREFIX/shim/"
+# The Push 3 companion's library stand-in: a device-OS library the image does
+# not carry (shim/swupdate-stub.c). The companion, which Live starts whenever
+# Push hardware is connected, cannot load without it.
+cp "$MODS/shim/libswupdate.so.0.1" "$PREFIX/compat_lib/"
 cp "$MODS/Options-desktop.txt" "$PREFIX/"
 cp -r "$MODS/tools/." "$PREFIX/tools/"
 # Executable here even when the folder came on a USB stick or a Windows file system.
@@ -516,6 +520,22 @@ fi
 cd "$PREFIX"
 rm -rf "$WORK"
 
+# --- browser catalog ---------------------------------------------------------------
+# Live's browser lists built-in devices from entries its indexer builds out of
+# the program's Builtin folder, which this image's indexer never processes; the
+# device categories (Instruments, Audio Effects, MIDI Effects, Modulators, Max
+# for Live) stay empty while Sounds and Drums work. The catalog is completed
+# from the image's own content (tools/browser-catalog.py).
+step "Completing the browser's device catalog"
+if command -v python3 >/dev/null 2>&1; then
+    python3 "$PREFIX/tools/browser-catalog.py" --program "$APP" --music "$(dirname "$CORE")" \
+        >>"$LOG" 2>&1 ||
+        note "the browser catalog step failed (see install.log): Instruments, Audio Effects, Modulators and Max for Live will be empty."
+else
+    note "python3 is missing, so the browser's device catalog was not completed: Instruments, Audio Effects, Modulators and Max for Live will be empty. Install python3 and run $PREFIX/tools/browser-catalog.py."
+fi
+ok
+
 # --- desktop integration -----------------------------------------------------------
 step "Adding Ableton Live 12 to the application menu"
 APPS="$DATA_HOME/applications"
@@ -533,6 +553,10 @@ cat > "$MIME_XML" <<'EOF'
     <comment>Ableton Live Pack</comment>
     <glob pattern="*.alp"/>
   </mime-type>
+  <mime-type type="application/x-ableton-authorization">
+    <comment>Ableton Authorization File</comment>
+    <glob pattern="*.auz"/>
+  </mime-type>
 </mime-info>
 EOF
 cat > "$DESKTOP" <<EOF
@@ -546,7 +570,7 @@ Icon=$APP/products/live/Live/AppLive/Linux/Icons/live_256.png
 Terminal=false
 Categories=Audio;AudioVideo;
 StartupWMClass=ableton-live
-MimeType=application/x-ableton-live-set;application/x-ableton-live-pack;x-scheme-handler/ableton;
+MimeType=application/x-ableton-live-set;application/x-ableton-live-pack;application/x-ableton-authorization;x-scheme-handler/ableton;
 EOF
 command -v update-mime-database >/dev/null && update-mime-database "$DATA_HOME/mime" >/dev/null 2>&1 || true
 command -v update-desktop-database >/dev/null && update-desktop-database "$APPS" >/dev/null 2>&1 || true

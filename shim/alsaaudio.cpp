@@ -25,6 +25,14 @@
 // converted 128 channels every cycle. The count is capped at the channels of
 // the hw device Live chose (opened briefly, or read from /proc/asound while
 // PipeWire holds it; 2 when neither works). LIVE_ALSA_CHANNELS=<n> sets the cap.
+//
+// The audio worker threads (the "AudioCalc" threads Live's engine fills its
+// work group with) are sized from the ONLINE cpu count: 15 of them on this
+// 16-core machine, and still 15 with the process pinned to 8 cores, so the
+// count comes from sysconf (_SC_NPROCESSORS_ONLN), not from the affinity
+// mask. LIVE_AUDIO_THREADS=<n> caps what Live's own calls see — fewer audio
+// worker threads, while nothing is pinned and every thread still runs on
+// every core. Calls from Live's libraries pass through untouched.
 #include <alsa/asoundlib.h>
 #include <dlfcn.h>
 #include <link.h>
@@ -194,6 +202,16 @@ extern "C" int snd_pcm_hw_params_set_channels(snd_pcm_t *pcm, snd_pcm_hw_params_
 // one period shorter, with no more dropouts in the tests. LIVE_ALSA_PERIODS=<n>
 // sets another count (3: Live's own). Periods under 64 frames keep 3: PipeWire
 // runs 64-frame cycles then, which 2 periods of 32 cannot cover.
+//
+// The ring also has to cover one of the graph's cycles: the plugin feeds the
+// stream out of it, and when the graph's quantum is fixed (clock.force-quantum)
+// the cycle stays whatever Live asks, so a ring below the quantum drains before
+// the next cycle refills it — every cycle then ends in an XRUN, recovered and
+// repeated (12,000 of them in the first minutes of a test install at Live's
+// fresh-install default of 3 x 128 frames against a 512-frame quantum). When
+// the quantum is unknown the graph follows the streams and adapts instead, and
+// no floor is applied. LIVE_ALSA_MINRING=<n> overrides the floor in frames at
+// the stream's rate (0: no floor).
 extern "C" int snd_pcm_hw_params_set_buffer_size(snd_pcm_t *pcm, snd_pcm_hw_params_t *params, snd_pcm_uframes_t val)
 {
     using SetBufferFn = int (*)(snd_pcm_t *, snd_pcm_hw_params_t *, snd_pcm_uframes_t);
@@ -208,5 +226,50 @@ extern "C" int snd_pcm_hw_params_set_buffer_size(snd_pcm_t *pcm, snd_pcm_hw_para
             break;
         }
     }
+    if (calledFromLive(__builtin_return_address(0))) {
+        for (const SharedPcm &shared : sharedPcms) {
+            if (shared.pcm != pcm)
+                continue;
+            unsigned graphRate = 0;
+            unsigned quantum = pipewireGraphTiming(&graphRate);
+            unsigned rate = 0;
+            int dir = 0;
+            if (quantum && snd_pcm_hw_params_get_rate(params, &rate, &dir) == 0 && rate && graphRate && graphRate != rate)
+                quantum = (unsigned)((uint64_t)quantum * rate / graphRate); // frames at the stream's rate
+            // The ring that covers the quantum with margin, and stays feasible:
+            // three periods of quantum/2 (the plugin refuses periods above the
+            // quantum, and rings at exactly one quantum are the measured storm
+            // boundary). quantum x 3/2 is integral for the power-of-two quanta
+            // PipeWire runs.
+            const unsigned needed = quantum / 2 * 3 + (quantum & 1 ? 3 : 0);
+            const unsigned floorFrames = [&] {
+                if (const char *ring = getenv("LIVE_ALSA_MINRING"))
+                    return (unsigned)strtoul(ring, nullptr, 10);
+                return needed;
+            }();
+            if (floorFrames && val < floorFrames) {
+                menufixTrace("alsaaudio: ring %d frames < quantum %d, lifted\n", int(val), int(floorFrames));
+                val = floorFrames;
+            }
+            break;
+        }
+    }
     return real(pcm, params, val);
+}
+
+// The audio worker pool's size comes from the online cpu count; only Live's
+// own queries are capped, everything else (Qt, plug-ins, libc internals) sees
+// the machine as it is.
+extern "C" long sysconf(int name)
+{
+    static auto real = reinterpret_cast<long (*)(int)>(nextSymbol("sysconf", "GLIBC_2.2.5"));
+    long result = real(name);
+    if ((name == _SC_NPROCESSORS_ONLN || name == _SC_NPROCESSORS_CONF) && calledFromLive(__builtin_return_address(0))) {
+        if (const char *capped = getenv("LIVE_AUDIO_THREADS")) {
+            const long cap = strtol(capped, nullptr, 10);
+            if (cap > 0 && result > cap)
+                result = cap;
+        }
+    }
+    return result;
 }

@@ -13,3 +13,8 @@ struct VirtualDevice {
 
 bool virtualDevicesEnabled();
 bool virtualDevice(int card, VirtualDevice &device);
+
+// PipeWire's graph cycle in frames at the graph's own rate (pwgraph.cpp),
+// with the rate out when known. 0 = unknown: the graph follows the streams
+// (or PipeWire did not answer), and no floor is needed.
+unsigned pipewireGraphTiming(unsigned *rate);

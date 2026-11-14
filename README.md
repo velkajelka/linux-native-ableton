@@ -5,7 +5,7 @@
 
 This project brings you the Linux build of Ableton Live 12 that ships inside the Push 3 recovery image as a normal desktop app. With some custom shims it transforms it into a fully functional Live 12, but running natively on Linux. The content the image lacks (Core Library, lessons, stem models, cursors, icon) comes from the Windows Suite installer.
 
-Ableton's files are not modified, and this repository contains none of them. A small launcher starts Live with a shim library preloaded. The shim makes Live work on the desktop: window, menus, file dialogs, plug-in editors, audio through PipeWire, and mixed-scale monitors.
+Ableton's files are not modified, and this repository contains none of them. A small launcher starts Live with a shim library preloaded. The shim makes Live work on the desktop: window, menus, file dialogs, plug-in editors, audio through PipeWire, mixed-scale monitors, Push hardware and Max for Live device views.
 
 This project is not affiliated with or endorsed by Ableton. Licensing is not touched: Live starts unauthorized, and you authorize it with your own Ableton account as usual.
 
@@ -20,6 +20,7 @@ This project is not affiliated with or endorsed by Ableton. Licensing is not tou
 Other requirements:
 - An x86-64 PC with PipeWire, and glibc 2.35 or newer (Ubuntu 22.04, Mint 21, Debian 12, Fedora 36 or newer).
 - An X11 session or Xwayland. Every mainstream desktop has one; Live runs as an X11 program.
+- `python3`, used by the installer to complete the browser's device catalog. Without it, Instruments, Audio Effects, MIDI Effects, Modulators and Max for Live stay empty (see [The browser's device categories](#the-browsers-device-categories)).
 - About 25 GB of free space while installing, and about 7 GB after (4.5 GB program, 2.1 GB Core Library).
 
 <br>
@@ -68,9 +69,9 @@ You do not need to install `innoextract`. The installer brings its own (see [inn
 
 GNOME Files opens scripts in the text editor by default. There, right-click `install.sh` and choose "Run as a Program", or use the terminal.
 
-The program goes to `~/.local/share/ableton-live-12`. Use `--prefix DIR` for another folder; the path must not contain spaces or quotes. The installer adds Ableton Live 12 to the application menu. `.als` and `.alp` files and `ableton://` links (used for browser authorization) open in it.
+The program goes to `~/.local/share/ableton-live-12`. Use `--prefix DIR` for another folder; the path must not contain spaces or quotes. The installer adds Ableton Live 12 to the application menu. `.als`, `.alp` and `.auz` files and `ableton://` links (used for browser authorization) open in it.
 
-The installation takes about 3 to 6 minutes and shows each of its 13 steps with a progress bar. You can delete the zips afterwards.
+The installation takes about 3 to 6 minutes and shows each step with a progress bar. You can delete the zips afterwards.
 
 ### Program loader
 
@@ -109,7 +110,126 @@ It asks whether to delete Live's settings and licence too (default: keep them). 
 
 While this appears like a fully functional build, it does not include some of the features the Windows build has, such as:
 
-REX loops, VST2 (VST3 works), EXS24/SoundFont/Kontakt import, web views, video export, Push 2 display, Pack downloads, screen-reader support, and media keys.
+REX loops, VST2 (VST3 works), EXS24/SoundFont/Kontakt import, web views, video export, Pack downloads, screen-reader support, and media keys.
+
+<br>
+
+## Push hardware
+
+Push 2 and Push 3 are supported. When Push hardware is connected, Live starts its companion program (`Push3`, from the Push 3 image) by itself; the companion drives the pads, the LED matrix and the display over USB. Leave the control-surface slots in Live's MIDI preferences at "None" — none of them is needed.
+
+Because the companion owns the hardware directly, Push devices do **not** appear in Live's MIDI preferences. In particular, do not select the "Push2" control surface: it is the legacy path of the desktop builds, and its display process does not exist in this build — selecting it stalls Live for a moment and the hardware stays dark.
+
+<br>
+
+## The browser's device categories
+
+Live lists built-in devices from entries its indexer builds out of the program's
+`Builtin` folder. The Push 3 image's indexer never processes that folder — the
+device did not need it — so **Instruments, Audio Effects, MIDI Effects,
+Modulators and Max for Live** were empty, while Sounds and Drums (plain Core
+Library content) worked.
+
+The installer completes the catalog from the image's own content
+(`tools/browser-catalog.py`): each device's declaration is added to the folder
+Live already indexes that holds its presets, the Max devices and MIDI tools are
+copied where Live indexes them, and the Modulators keyword entries are added to
+the Core Library's metadata manifest. Idempotent, and nothing in Ableton's
+program folder is modified.
+
+If those categories are ever empty again — for example after resetting Live's
+database — run it once and restart Live:
+
+```sh
+~/.local/share/ableton-live-12/tools/browser-catalog.py
+```
+
+<br>
+
+## Max for Live device views
+
+Max for Live devices draw their interface in their own native windows. On
+Windows those windows are children of the device chain's window, so the OS
+clips them together with it. On Linux Live draws its whole interface in one
+window, and these views are children of it with nothing managing them, so the
+shim takes that role. A 30 Hz manager reads the device chain's own list of
+views and places each one on its device's frame; it hides the ones that are
+out of view.
+
+It follows the device chain through slow and fast scrolling, overview jumps,
+left/right arrow navigation, adding or removing effects, track switches,
+duplicated tracks and empty tracks. A view that is partly on screen is clipped
+exactly as its frame is, so the two always move together; it is hidden only
+once nothing of it remains visible, and reappears over its device when it comes
+back. This works at any UI zoom, including values below 60 % in Live's
+Preferences, and after resizing the window or switching between fullscreen and
+a narrow window. Animations and LFOs stay smooth because the manager only
+re-lays a view out when its rectangle actually changes.
+
+**Before:** at 125 % each view sat about 350 px above its device frame and
+filled only four fifths of it. Scrolling the chain could leave clipped slivers
+over other devices; clicking away could leave views over the wrong device; and
+a fullscreen-to-narrow change could blank or hide the rightmost views until
+they were scrolled away and back.
+
+**After:** the views sit exactly over their device's frame at any zoom and
+display scale, and fill it. They follow the chain while it scrolls, hide when
+their device leaves the viewport, and reappear over the device when it comes
+back. They disappear whenever the detail area shows Clip view — and when it
+is collapsed — and come back with the Device view, whichever way you switch
+(the tabs, Shift+Tab, the View menu, or Alt+3 / Alt+4). A view that becomes
+visible repaints immediately, including after a fullscreen change.
+
+The chain's usable right edge is learned from the layout Live reports for its
+own views: a clipped view says where the chain ends. Clamps that imply an
+impossible side panel, or that were measured against a different window size
+(Live starts at 800 px before it is made fullscreen), are ignored or rescaled
+instead of being trusted. When a side panel is open, the device chain ends
+before the window's edge, and the manager tracks that from the same layouts.
+
+All of it follows Live's own detail-view state, so there is nothing to
+configure. These environment variables turn parts of it off, or pin the chain
+to a side panel, for comparison:
+
+| Variable | Effect |
+|---|---|
+| `LIVE_M4L_MANAGER=0` | Disable the Max-view manager; Live's native view placement and hiding apply. |
+| `LIVE_M4L_NOHIDE=1` | Keep the views on screen in Clip view. |
+| `LIVE_MAX_SCALE=0` | Leave the Max runtime at its own scale. |
+| `LIVE_M4L_RIGHT_INSET=<px>` | Say where the chain ends when a side panel is permanently open: that many pixels from the window's right edge. Without it the edge is learned from Live's layouts. |
+
+**Known limitations.** Toggling the left info view moves the chain's left edge,
+and the manager only learns that edge from a view clipped on its left, so the
+first devices can be clipped or missing until the chain is scrolled once.
+Opening or closing the right side panel has the same effect on the right edge,
+and it is corrected at the next clipped layout. Neither happens during normal
+scrolling, clicking, zooming or resizing.
+
+These hooks are written for Live 12.4.7 from the Push 3 image and check the
+build before using it. On another build the manager stays inactive and the
+views use Live's native behavior rather than guess.
+
+<br>
+
+## Audio and PipeWire
+
+Live talks ALSA, and the shim sends its hardware accesses to PipeWire: Live's device menu lists PipeWire's outputs and inputs (card 100 is "System Default", which follows the desktop's choice), samples leave in floating point instead of being cut to 16 bits, and the sound shares the sound card with the desktop through `pipewire-alsa`.
+
+PipeWire's graph cycles at its *quantum* (512 frames at 48 kHz on many systems; `pw-metadata -n settings` shows yours). The plugin feeds its stream out of Live's ALSA ring, and a ring shorter than a cycle drains before the next cycle refills it: every cycle then ends in an XRUN, hundreds per second, and the sound crackles or stays silent. Live's fresh-install default (three periods of 128 frames) is smaller than one cycle on such systems, so the shim lifts the ring to cover the quantum — Live's own buffer setting from that point on is respected as long as it stays above it.
+
+The audio path has settings, all optional:
+
+| Setting | Meaning |
+|---|---|
+| `LIVE_ALSA_DEVICE=pcm` | The ALSA PCM Live's hardware opens go to (`pipewire` by default; `hw:...` for the raw card) |
+| `LIVE_ALSA_EXCLUSIVE=1` | Direct hardware access, Live owns the card (as on the Push) |
+| `LIVE_ALSA_FORMAT=device` | Leave the sample format to ALSA (default: the best of float/S32/S24) |
+| `LIVE_ALSA_CHANNELS=n` | Cap the channel count Live opens (default: the device's own) |
+| `LIVE_ALSA_PERIODS=n` | Periods in the ring (default 2; 3 is Live's own) |
+| `LIVE_ALSA_MINRING=n` | The smallest ring, in frames (default: PipeWire's quantum; 0 disables) |
+| `LIVE_AUDIO_THREADS=n` | Cap the audio worker threads Live creates (Live sizes them from the cpu count: 15 on a 16-core machine). Nothing is pinned — the threads still run on every core |
+
+These can also be kept in `Options-desktop.txt`, as lines starting with `-_Live`: Live silently ignores unknown options of that shape (verified against 12.4.7), so they can sit in the file it reads, and the shim applies them itself. `-_LiveAudioThreads=8` does what `LIVE_AUDIO_THREADS=8` does, and survives every start.
 
 <br>
 
@@ -137,6 +257,11 @@ Live finds plug-ins in the usual folders (`~/.vst3`, `/usr/lib/vst3`, `/usr/loca
 | `innoextract` errors such as "Unexpected setup data version: 6.4.0.1" | Your system's innoextract is 1.9 or older. The installer uses its bundled copy first; check `install.log` for its messages. |
 | `xdg-mime: ... qtpaths: command not found` in the terminal (Fedora) | Harmless. |
 | Saving and exporting are deactivated | Live is not authorized yet. Authorize it with your Ableton account. |
+| Push 2 or Push 3 stays dark or its LEDs keep flashing | Live's companion cannot open the USB device. Give the user read/write access to Ableton's USB devices (matches Push 2 and Push 3): `echo 'SUBSYSTEM=="usb",ATTR{idVendor}=="2982",MODE="0660",GROUP="audio"' \| sudo tee /etc/udev/rules.d/99-ableton-push.rules && sudo udevadm control --reload && sudo udevadm trigger`, then replug the hardware and restart Live. You must be in the `audio` group. |
+| Audio crackles, and Live's log fills with `State=XRUN` | Live's ring is shorter than one PipeWire cycle. The shim lifts it to cover the quantum automatically; if your quantum is unusual (above 1024 frames), either raise Live's buffer to match (`pw-metadata -n settings` shows the quantum) or set `LIVE_ALSA_MINRING` (see [Audio and PipeWire](#audio-and-pipewire)). |
+| A file dialog never appears and Live looks frozen (KDE on Wayland) | The desktop portal is a native Wayland client and cannot attach its dialog to Live's XWayland window. Wayland sessions use Qt's own dialogs for this reason; if a portal dialog still hangs, restart it with `systemctl --user restart plasma-xdg-desktop-portal-kde.service` and start Live again. `LIVE_NATIVE_DIALOGS=0` uses Live's own dialogs instead. |
+| Instruments, Audio Effects, MIDI Effects, Modulators or Max for Live are empty | Live's browser catalog was not completed, or Live rebuilt its database after it was. Quit Live, run `~/.local/share/ableton-live-12/tools/browser-catalog.py`, and start Live again (see [The browser's device categories](#the-browsers-device-categories)). |
+| Max for Live device views are misplaced, drawn small, stuck over other devices, or blank | The Max-view manager is inactive, or it did not recognize this Live build. It disables itself on a build whose layout, chain or rect-getter prologues do not match Live 12.4.7 from the Push 3 image; check that `LIVE_M4L_MANAGER` is not set to `0`. On a supported build, a view that is clipped or missing right after toggling the info view or the side panel is corrected by scrolling the chain once; the manager learns that edge from a clipped view. If a view stays blank after that, note the window size and zoom when reporting it. |
 
 <br>
 
@@ -148,12 +273,13 @@ Live finds plug-ins in the usual folders (`~/.vst3`, `/usr/lib/vst3`, `/usr/loca
 | `shim/` | `libmenufix.so` (prebuilt) and its sources |
 | `tools/AbletonLive12-launcher` | The launcher, prebuilt from `tools/launcher.c` (static) |
 | `tools/import-windows-content.sh` | Copies the Core Library, lessons, high-quality stem models and `Installation.cfg` (the edition: Suite) from the Suite installer |
+| `tools/browser-catalog.py` | Completes Live's browser: declares the built-in devices, and copies the Max devices and MIDI tools where Live indexes them (the installer runs it) |
 | `tools/make-assets` | Makes Live's cursors and icon from the Suite's files; prebuilt from `tools/make-assets.cpp`, runs on Live's bundled Qt |
 | `tools/kwin-plugin-rule.sh` | KDE: no minimize button on plug-in windows (the shim runs it) |
 | `tools/bundled/innoextract` | innoextract 1.10-dev, which reads Live 12.4.7's installer |
 | `tools/bundled/libxkbcommon*.so.0` | xkbcommon 1.5.0 from Debian 12, used only when the system has none |
 | `tools/innoextract-compat.cpp` | Lets the bundled innoextract run on glibc 2.35 |
-| `Options-desktop.txt` | Live options: ALSA MIDI, no start-up messages, no auto-updates |
+| `Options-desktop.txt` | Live options (ALSA MIDI, no start-up messages, no auto-updates) and the shim's own `-_Live...` settings |
 
 <br>
 

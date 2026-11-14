@@ -12,7 +12,9 @@
 //     Wayland plug-in), desktop file dialogs through xdg-desktop-portal
 //     (LIVE_NATIVE_DIALOGS=0: Live's own);
 //   - LC_NUMERIC=C: Live reads Live Set numbers with the locale's strtod;
-//   - LIVEDEBUGOPTIONS: Options-desktop.txt next to push3_opt/;
+//   - LIVEDEBUGOPTIONS: Options-desktop.txt next to push3_opt/ — its lines
+//     starting with "-_Live" are this project's own settings, applied here
+//     (Live silently ignores unknown options of that shape — verified);
 //   - HOME: the user's own, as for any Linux program (Live then keeps its
 //     settings in ~/.config/Ableton and ~/.local/share/Ableton, and its
 //     libraries in the desktop's Music folder, XDG_MUSIC_DIR/Ableton), or an
@@ -190,9 +192,20 @@ __attribute__((constructor(102))) void setUpEnvironment()
     // scale to a whole number (125 % gave 1x, 150 to 200 % all 2x). Keep the
     // exact factor, so Live scales with the desktop as on Windows.
     setDefault("QT_SCALE_FACTOR_ROUNDING_POLICY", "PassThrough");
+    // Live's file dialogs go through the desktop's portal (filedialogs.cpp).
+    // The KDE portal is a native Wayland client: given an XWayland window, it
+    // cannot parent its dialog to it, so the dialog never appears and Live
+    // waits in the call forever. Wayland sessions therefore use Qt's own
+    // dialog; X11 sessions keep the desktop's native one.
     const char *dialogs = getenv("LIVE_NATIVE_DIALOGS");
-    if (!dialogs || strcmp(dialogs, "0") != 0)
-        setDefault("QT_QPA_PLATFORMTHEME", "xdgdesktopportal");
+    if (!dialogs || strcmp(dialogs, "0") != 0) {
+        const char *session = getenv("XDG_SESSION_TYPE");
+        const char *wayland = getenv("WAYLAND_DISPLAY");
+        const bool xwayland = (session && !strcmp(session, "wayland")) || (wayland && *wayland);
+        if (!xwayland)
+            setDefault("QT_QPA_PLATFORMTHEME", "xdgdesktopportal");
+        menufixTrace("standalone: portal file dialogs %d\n", !xwayland);
+    }
     // Live's PipeWire streams (pipewire-alsa reads this) show as "Ableton Live"
     // in the desktop's volume mixer instead of "PipeWire ALSA [AbletonLive12]".
     loadXkbcommon(app);
@@ -209,6 +222,28 @@ __attribute__((constructor(102))) void setUpEnvironment()
                 fputs("-_LinuxMidiBackend=Alsa\n-SuppressStartUpMessages\n-_DisableAutoUpdates\n", f);
                 fclose(f);
             }
+        // The file also carries settings of this project itself, as lines
+        // starting with "-_Live" — Live silently ignores unknown options of
+        // that shape (verified), so they can stay in the file it reads.
+        if (FILE *f = fopen(options.c_str(), "r")) {
+            char buffer[512];
+            while (fgets(buffer, sizeof buffer, f)) {
+                const std::string line = buffer;
+                if (line.compare(0, 6, "-_Live") != 0)
+                    continue;
+                const size_t eq = line.find('=');
+                const std::string key = line.substr(6, eq == std::string::npos ? std::string::npos : eq - 6);
+                std::string value = eq == std::string::npos ? "" : line.substr(eq + 1);
+                while (!value.empty() && (value.back() == '\n' || value.back() == '\r' || value.back() == ' '))
+                    value.pop_back();
+                if (key == "AudioThreads" && !value.empty() &&
+                    value.find_first_not_of("0123456789") == std::string::npos) {
+                    setenv("LIVE_AUDIO_THREADS", value.c_str(), 0); // an explicit environment wins
+                    menufixTrace("standalone: audio worker threads capped\n", 0, 0, 0);
+                }
+            }
+            fclose(f);
+        }
         setenv("LIVEDEBUGOPTIONS", options.c_str(), 1);
     }
 
@@ -270,6 +305,59 @@ bool isRegistration(const char *program)
     return (len == 16 && !strncmp(name, "xdg-desktop-menu", len)) || (len == 8 && !strncmp(name, "xdg-mime", len));
 }
 
+// Live starts the Push 3 companion (Push3) by itself whenever Push hardware
+// appears. It was built for the desktop and passes two options the image's
+// device build of Push3 does not parse; the companion answers "Invalid
+// arguments: unrecognised option" and exits before it touches any hardware.
+// Drop the options the image's Push3 does not have (verified against its own
+// option list: parent-process-id, log-level, log-file, dont-log-to-console,
+// log-to-syslog, no-parent, screenshot-filename, python-log-filters,
+// webservice-id-file, update-server-url, crashpad-fd), so Live's launch works.
+
+bool isCompanion(const char *path)
+{
+    if (!shimActive || !path)
+        return false;
+    const char *name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+    return strcmp(name, "Push3") == 0;
+}
+
+bool droppedCompanionOption(const char *arg)
+{
+    static const char *const unsupported[] = {"--show-developer-window", "--language"};
+    for (const char *option : unsupported) {
+        const size_t len = strlen(option);
+        if (!strncmp(arg, option, len) && (arg[len] == '\0' || arg[len] == '='))
+            return true;
+    }
+    return false;
+}
+
+// A filtered argv copy (strings shared with the original), or null when
+// nothing needs dropping. The caller frees the array after the exec attempt.
+char **filteredCompanionArgs(char *const argv[])
+{
+    size_t count = 0;
+    while (argv[count])
+        ++count;
+    size_t kept = 0;
+    for (size_t i = 0; i < count; ++i)
+        kept += !droppedCompanionOption(argv[i]);
+    if (kept == count)
+        return nullptr;
+    auto **copy = static_cast<char **>(malloc((kept + 1) * sizeof(char *)));
+    if (!copy)
+        return nullptr;
+    size_t out = 0;
+    for (size_t i = 0; i < count; ++i)
+        if (!droppedCompanionOption(argv[i]))
+            copy[out++] = argv[i];
+    copy[out] = nullptr;
+    menufixTrace("standalone: companion launched with %d of %d options\n", int(out), int(count));
+    return copy;
+}
+
 // The program itself, or a shell running it: sh -c "xdg-mime install ...".
 bool runsRegistration(const char *path, char *const argv[])
 {
@@ -292,7 +380,10 @@ extern "C" int execv(const char *path, char *const argv[])
     static auto next = real<int (*)(const char *, char *const[])>("execv", "GLIBC_2.2.5");
     if (runsRegistration(path, argv))
         _exit(0); // in Live's child process, before the exec
-    return next(path, argv);
+    char **filtered = isCompanion(path) ? filteredCompanionArgs(argv) : nullptr;
+    const int result = next(path, filtered ? filtered : argv);
+    free(filtered);
+    return result;
 }
 
 extern "C" int execve(const char *path, char *const argv[], char *const envp[])
@@ -300,7 +391,10 @@ extern "C" int execve(const char *path, char *const argv[], char *const envp[])
     static auto next = real<int (*)(const char *, char *const[], char *const[])>("execve", "GLIBC_2.2.5");
     if (runsRegistration(path, argv))
         _exit(0);
-    return next(path, argv, envp);
+    char **filtered = isCompanion(path) ? filteredCompanionArgs(argv) : nullptr;
+    const int result = next(path, filtered ? filtered : argv, envp);
+    free(filtered);
+    return result;
 }
 
 // A spawned process has to exist (the caller waits for it): `true` runs instead.
@@ -312,7 +406,10 @@ extern "C" int posix_spawn(pid_t *pid, const char *path, const posix_spawn_file_
     static char *const trueArgv[] = {const_cast<char *>("true"), nullptr};
     if (runsRegistration(path, argv))
         return next(pid, "/bin/true", actions, attr, trueArgv, envp);
-    return next(pid, path, actions, attr, argv, envp);
+    char **filtered = isCompanion(path) ? filteredCompanionArgs(argv) : nullptr;
+    const int result = next(pid, path, actions, attr, filtered ? filtered : argv, envp);
+    free(filtered);
+    return result;
 }
 
 extern "C" int posix_spawnp(pid_t *pid, const char *file, const posix_spawn_file_actions_t *actions,
@@ -323,7 +420,10 @@ extern "C" int posix_spawnp(pid_t *pid, const char *file, const posix_spawn_file
     static char *const trueArgv[] = {const_cast<char *>("true"), nullptr};
     if (runsRegistration(file, argv))
         return next(pid, "true", actions, attr, trueArgv, envp);
-    return next(pid, file, actions, attr, argv, envp);
+    char **filtered = isCompanion(file) ? filteredCompanionArgs(argv) : nullptr;
+    const int result = next(pid, file, actions, attr, filtered ? filtered : argv, envp);
+    free(filtered);
+    return result;
 }
 
 extern "C" int system(const char *command)
