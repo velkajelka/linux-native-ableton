@@ -2,13 +2,13 @@
 # Installs Ableton Live 12 as a Linux desktop app: the Linux build from the
 # Push 3 recovery image, the content the image lacks from the Windows Suite
 # installer (Core Library, lessons, high-quality stem models, cursors, icon,
-# edition), and the shim and launcher next to this script. Live's own files
-# stay as Ableton made them. Live then runs like any Linux program: settings
-# in ~/.config/Ableton and ~/.local/share/Ableton, libraries in the desktop's
-# Music folder (<Music>/Ableton). Writes uninstall.sh into the install folder.
-# A run that stops (an error, a full disk, the window closed) can be started
-# again: it continues after the last finished part. What the tools report goes
-# to install.log in the install folder.
+# edition), and the shim, the launcher and the themes next to this script.
+# Live's own files stay as Ableton made them. Live then runs like any Linux
+# program: settings in ~/.config/Ableton and ~/.local/share/Ableton, libraries
+# in the desktop's Music folder (<Music>/Ableton). Writes uninstall.sh into the
+# install folder. A run that stops (an error, a full disk, the window closed)
+# can be started again: it continues after the last finished part. What the
+# tools report goes to install.log in the install folder.
 #
 # usage: install.sh [--prefix DIR]
 #   Put the Push 3 recovery image (Push3-RecoveryImage-*.zip) and the Windows
@@ -78,7 +78,7 @@ export DEBUGFS_PAGER=__none__
 # --- terminal output ------------------------------------------------------------------
 # A numbered line per step, a progress bar under it while it runs, then the
 # time it took. Without a terminal (a log file) only the lines are written.
-STEPS=14
+STEPS=15
 STEP=0
 STEP_START=$SECONDS
 if [ -t 1 ]; then
@@ -434,6 +434,25 @@ cp "$PREFIX/tools/AbletonLive12-launcher" "$APP/AbletonLive12"
 mkdir -p "$APP/lib/xkbcommon"
 cp "$PREFIX/tools/bundled/"lib*.so.* "$APP/lib/xkbcommon/"
 ok
+
+# --- Themes -------------------------------------------------------------------------
+# Live's theme chooser lists the .ask files in this folder and nothing else, so
+# every theme under themes/ is copied next to Ableton's. The folders inside
+# themes/ keep each set's licence and notice with the files they cover.
+step "Installing themes"
+THEMES="$APP/products/live/Live/AppLive/Resources/Themes"
+mapfile -t themes < <(find "$MODS/themes" -type f -name '*.ask' 2>/dev/null | sort)
+if [ ${#themes[@]} -eq 0 ]; then
+    note "no .ask files under themes/; nothing to install"
+    ok
+elif [ -d "$THEMES" ]; then
+    for f in "${themes[@]}"; do cp "$f" "$THEMES/"; done
+    names=$(printf '%s,' "${themes[@]##*/}" | sed 's/\.ask,/, /g; s/, $//')
+    ok "$names"
+else
+    note "Live's Themes folder is missing; the themes were not installed"
+    ok
+fi
 
 # --- Windows Suite: content the image lacks -----------------------------------------
 step "Unpacking the Suite installer"

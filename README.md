@@ -233,6 +233,33 @@ These can also be kept in `Options-desktop.txt`, as lines starting with `-_Live`
 
 <br>
 
+## Themes
+
+Live's theme chooser lists the `.ask` files in its program folder. The
+installer copies every `.ask` file under `themes/` into that folder, next to
+Ableton's own and without touching them. Two are included: **Catppuccin
+Mocha** (dark) and **Catppuccin Latte** (light), the palette the Wires
+distribution uses.
+
+To add your own, put the `.ask` file in a subfolder of `themes/` — keep the
+licence or readme it came with beside it — and run `install.sh` again. Files
+are copied by name, and a file with a name Live's folder already has is
+replaced.
+
+Choose a theme in Live's Preferences, in the *Theme & Colors* section; Live
+remembers the choice, as it does for its own themes.
+
+A Live update that replaces the program folder takes the copied themes with
+it. Run `install.sh` again to put them back, or copy them from `themes/`
+yourself. To remove one, select another theme first and delete its `.ask` file
+from `<install folder>/push3_opt/push3/products/live/Live/AppLive/Resources/Themes/`.
+
+The Catppuccin files are LGPL-2.1, not GPL-3.0, and are not covered by this
+repository's licence; see `themes/catppuccin/NOTICE` and the `LICENSE` beside
+it. Themes you add yourself keep whatever terms they came with.
+
+<br>
+
 ## Where Live keeps its files
 
 Live behaves like any Linux program and uses your home folder, the same places it uses on Windows and macOS:
@@ -271,6 +298,7 @@ Live finds plug-ins in the usual folders (`~/.vst3`, `/usr/lib/vst3`, `/usr/loca
 |---|---|
 | `install.sh` | The installer |
 | `shim/` | `libmenufix.so` (prebuilt) and its sources |
+| `themes/` | Themes the installer copies into Live: Catppuccin Mocha and Latte, plus any `.ask` you add (see [Themes](#themes)) |
 | `tools/AbletonLive12-launcher` | The launcher, prebuilt from `tools/launcher.c` (static) |
 | `tools/import-windows-content.sh` | Copies the Core Library, lessons, high-quality stem models and `Installation.cfg` (the edition: Suite) from the Suite installer |
 | `tools/browser-catalog.py` | Completes Live's browser: declares the built-in devices, and copies the Max devices and MIDI tools where Live indexes them (the installer runs it) |
@@ -293,3 +321,4 @@ Live 12.4.7's Suite installer is made with Inno Setup 6.4. innoextract 1.9, the 
 
 - innoextract: zlib licence, see `tools/bundled/LICENSE.innoextract`.
 - xkbcommon: MIT licence.
+- Catppuccin Mocha and Latte themes (`themes/catppuccin/`): LGPL-2.1, from the Wires distribution; see its `NOTICE`. They are aggregated with this repository, not covered by its GPL-3.0 licence. The Catppuccin palette itself is MIT.

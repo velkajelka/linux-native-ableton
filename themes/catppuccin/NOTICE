@@ -1,0 +1,29 @@
+Catppuccin themes for Ableton Live
+
+Catppuccin Mocha.ask and Catppuccin Latte.ask come from the Wires Ableton
+Live 12 distribution, which ships them in its files/support/ folder together
+with a copy of the LGPL-2.1 licence text (files/support/LICENCE.ableton-linux,
+byte-identical to shibco/ableton-linux's LICENCE). Wires lists the themes in
+the same support set as that licence file and carries no other licence,
+notice or attribution for them, so they are redistributed here under
+LGPL-2.1, whose text is in the LICENSE file next to this notice.
+
+The Wires runtime credits the project's maintainers for its contents:
+
+    Cade Diehm
+    Lucas Gillingham
+    Wires, built on https://github.com/shibco/ableton-linux
+
+These files are not part of this repository's GPL-3.0 work and are not
+relicensed under it. They are aggregated alongside it under their own terms:
+keep this NOTICE and LICENSE with them when you copy or redistribute them.
+
+The Catppuccin colour palette is by the Catppuccin contributors and is
+released under the MIT licence (https://github.com/catppuccin/catppuccin).
+The themes are an adaptation of that palette for Live's theme format; their
+colour values are not copied from the upstream project, so the credit here
+is a courtesy rather than a licence condition.
+
+Wires also ships "Catppuccin Auto.ask", which is byte-identical to
+"Catppuccin Mocha.ask" (SHA-256 61de4018...) and therefore does not follow
+the system light/dark setting. It is not included in this folder.
