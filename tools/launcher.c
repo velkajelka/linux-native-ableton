@@ -18,6 +18,7 @@
 // Built static (tools/install-launcher.py), so the launcher itself needs no
 // loader and no particular glibc.
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,6 +28,60 @@
 
 static const char kLoader[] = "/lib/ld-linux-x86-64.so.2";
 static const char kShim[] = "../../shim/libmenufix.so";
+
+// Instance detection files Live leaves behind when it crashes. The next
+// launch then starts as a *second* instance, and Live keeps the browser's file
+// operations and drop targets off: menus show only "Show in Folder", no New
+// Folder/Delete, no drag-and-drop anywhere in the browser. Remove them when no
+// Live is running; while one is, they belong to it and Live handles a second
+// launch itself.
+static const char kInstanceSocket[] = "/tmp/abl-live-detection";
+static const char *const kInstanceShm[] = {
+    "/dev/shm/abl-live-inter-communication",
+    "/dev/shm/sem.abl-live-inter-communication-mutex",
+};
+
+static int liveProcessRunning(void)
+{
+    DIR *dir = opendir("/proc");
+    if (!dir)
+        return 1; // cannot tell: keep the files
+    static const char suffix[] = "/push3_opt/push3/Live";
+    struct dirent *entry;
+    int found = 0;
+    while (!found && (entry = readdir(dir))) {
+        if (entry->d_name[0] < '0' || entry->d_name[0] > '9')
+            continue;
+        char path[PATH_MAX], exe[PATH_MAX];
+        snprintf(path, sizeof path, "/proc/%s/exe", entry->d_name);
+        const ssize_t n = readlink(path, exe, sizeof exe - 1);
+        if (n <= 0)
+            continue;
+        exe[n] = '\0';
+        const size_t len = strlen(exe), tail = sizeof suffix - 1;
+        found = len >= tail && strcmp(exe + len - tail, suffix) == 0;
+    }
+    closedir(dir);
+    return found;
+}
+
+// socketPath and shm[] are parameters so the removal itself can be tested
+// without touching a running Live's files.
+static void removeInstanceFiles(const char *socketPath, const char *const shm[], size_t shmCount)
+{
+    int removed = unlink(socketPath) == 0;
+    for (size_t i = 0; i < shmCount; ++i)
+        removed |= unlink(shm[i]) == 0;
+    if (removed)
+        fprintf(stderr, "AbletonLive12: cleared instance files left by a crashed Live\n");
+}
+
+static void clearStaleInstance(void)
+{
+    if (liveProcessRunning())
+        return;
+    removeInstanceFiles(kInstanceSocket, kInstanceShm, sizeof kInstanceShm / sizeof kInstanceShm[0]);
+}
 
 // stderr, and a dialog when started from a menu (no terminal to read it).
 static void report(const char *message)
@@ -107,6 +162,7 @@ int main(int argc, char **argv)
 
     char live[PATH_MAX + 8];
     snprintf(live, sizeof live, "%s/Live", app);
+    clearStaleInstance();
     execv(live, argv);
     perror("AbletonLive12: Live");
     return 1;
