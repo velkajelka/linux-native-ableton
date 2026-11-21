@@ -41,6 +41,11 @@ This project is not affiliated with or endorsed by Ableton. Licensing is not tou
 - Max for Live device interfaces are hidden in Clip view and over a collapsed detail area, and placed and scaled correctly at desktop scales other than 100 %. `LIVE_MAX_VIEWS=0` turns this off.
 - Your own themes: put `.ask` files into `~/.local/share/Ableton/Themes/Live 12/` (Live 11: `Themes/Live 11/`) and restart Live.
 
+**Scroll wheel and touchpad**
+- The mouse wheel and touchpad scroll now change the value under the pointer: knobs, sliders, number boxes, the mixer's track volume, pan and sends, device parameters, rack macros and the dials, sliders and number boxes of Max for Live devices. Live 12.4.7's Linux build only scrolled lists. Undo, automation and modulation work as for a mouse drag.
+- Hold Ctrl or Shift for fine steps. `LIVE_WHEEL_VALUES=0` turns this off. Not on Live 11.
+- `LIVE_WHEEL_TRACE=1` with `MENUFIX_DEBUG=<file>` logs how scroll events reach Live, for bug reports.
+
 **Fixes**
 - Instruments, Audio Effects, MIDI Effects, Modulators and Max for Live were empty in the browser with the default install folder (Live skips paths with a hidden folder such as `.local`).
 - Live's display stood still while a file dialog was open.

@@ -73,6 +73,7 @@
 #include <cstdlib>
 
 void menufixTrace(const char *fmt, int a = 0, int b = 0, int c = 0);
+bool wheelSynthPointer(QPoint *position); // wheelvalues.cpp: virtual pointer while a wheel drag runs
 bool redirectFunction(uintptr_t fn, const unsigned char *prologue, size_t len, void *target); // hook.cpp
 
 namespace {
@@ -116,7 +117,9 @@ Display *display()
 
 uint64_t getPosition()
 {
-    const QPoint p = QCursor::pos();
+    QPoint p;
+    if (!wheelSynthPointer(&p))
+        p = QCursor::pos();
     if (traceWarps())
         menufixTrace("pointerwarp: get %d,%d\n", p.x(), p.y());
     return pack(p);
@@ -124,6 +127,8 @@ uint64_t getPosition()
 
 void setPosition(void *, uint64_t packed)
 {
+    if (wheelSynthPointer(nullptr))
+        return; // a wheel drag: the real pointer stays put
     if (reinterpret_cast<bool (*)()>(base + kPointerDisabled)())
         return;
     const QPoint p(int32_t(packed), int32_t(packed >> 32));
