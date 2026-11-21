@@ -12,6 +12,10 @@
 //     Push 3's Tiger Lake), also preloads the AVX-512 emulator
 //     (../../shim/libavx512emu.so), which translates those instructions to
 //     AVX2 as they are reached. LIVE_AVX512EMU=1 forces it, =0 turns it off;
+//   - loads ../../shim/libhideexports.so as a loader audit module (LD_AUDIT,
+//     by full path), which keeps Live's built-in FreeType, HarfBuzz and libpng
+//     to Live, so plug-ins and system libraries get the system's
+//     (shim/hideexports.c). LIVE_HIDE_EXPORTS=0 turns it off;
 //   - adds push3_opt/push3/lib and compat_lib to LD_LIBRARY_PATH: Live's own
 //     RPATH covers lib/ only, and the loader needs FFmpeg 5 and ICU 70 (Live
 //     11: FFmpeg 58, ICU 66, OpenSSL 1.1) from compat_lib before the shim runs;
@@ -210,6 +214,14 @@ int main(int argc, char **argv)
             return 1;
         }
     }
+
+    // Keeps Live's built-in FreeType, HarfBuzz and libpng to Live itself
+    // (shim/hideexports.c). By full path: the loader opens it before any chdir.
+    const char *hide = getenv("LIVE_HIDE_EXPORTS");
+    char audit[PATH_MAX + 32];
+    snprintf(audit, sizeof audit, "%s/shim/libhideexports.so", root);
+    if (!(hide && !strcmp(hide, "0")) && access(audit, R_OK) == 0)
+        prepend("LD_AUDIT", audit);
 
     const char *force = getenv("LIVE_AVX512EMU");
     const int level = cpu_level();

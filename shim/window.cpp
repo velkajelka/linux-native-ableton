@@ -35,14 +35,32 @@
 // clicking Live's main window buries the editor behind it. The editor
 // windows (seen by pluginclose.cpp's XCreateWindow interposer) are made
 // transient for Live's active main window, with Live's window class and icon.
+//
+// Title bar colours: KDE's window manager draws a window's title bar from the
+// colour scheme named by the window's _KDE_NET_WM_COLOR_SCHEME property (the
+// absolute path of a .colors file; type STRING), read again when the property
+// changes. applyTitleBarColours writes a scheme with Live's band colour into
+// Live's data folder and names it on Live's windows, so the title bar and
+// Live's top band read as one surface; it runs again on every theme change.
+//
+// Splash screen zoom (Live 12.4.7): the splash screen always opened at 100 %
+// whatever Zoom the main window had. The shim records the main window's Zoom
+// in Live's config folder (LinuxSplashZoom.txt, splashzoom.cpp) whenever it
+// changes, and the splash opens at that Zoom at the next start. Every other
+// window opens as before.
+#include "chrome.h"
 #include "livebuild.h"
+#include "splashzoom.h"
 #include <QApplication>
 #include <QDir>
+#include <QFile>
 #include <QIcon>
 #include <QMainWindow>
 #include <QPointer>
 #include <QScreen>
+#include <QStandardPaths>
 #include <QThread>
+#include <QTimer>
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -53,6 +71,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 void menufixTrace(const char *fmt, int a = 0, int b = 0, int c = 0);
@@ -67,6 +86,30 @@ bool isLiveMainWindow(QWidget *w)
     return w && w->isWindow() && w->windowType() == Qt::Window && w->inherits("QMainWindow");
 }
 
+// The shim's own connection to the X server (GUI thread only).
+Display *ownDisplay()
+{
+    static Display *dpy = XOpenDisplay(nullptr);
+    return dpy;
+}
+
+QByteArray schemePath; // the title bar colour scheme in use, empty before the first
+
+// Windows with a title bar.
+bool decorated(QWidget *w)
+{
+    return w->isWindow() && (w->windowType() == Qt::Window || w->windowType() == Qt::Dialog);
+}
+
+void setColorScheme(QWidget *w)
+{
+    Display *dpy = ownDisplay();
+    if (!dpy || schemePath.isEmpty() || !w->internalWinId())
+        return;
+    XChangeProperty(dpy, w->internalWinId(), XInternAtom(dpy, "_KDE_NET_WM_COLOR_SCHEME", False), XA_STRING, 8,
+                    PropModeReplace, reinterpret_cast<const unsigned char *>(schemePath.constData()), schemePath.size());
+}
+
 // The Live main window whose view is being painted (see liveWindowPainted).
 QPointer<QWidget> paintingWindow;
 
@@ -75,7 +118,16 @@ class WindowFilter : public QObject
 public:
     bool eventFilter(QObject *o, QEvent *e) override
     {
-        if (e->type() == QEvent::Paint && o->isWidgetType()) {
+        if (e->type() == QEvent::Show && o->isWidgetType() && !schemePath.isEmpty()) {
+            auto *w = static_cast<QWidget *>(o);
+            // Once Qt has sent its own requests for the new window (the
+            // window manager reads the property again when it changes).
+            if (decorated(w))
+                QTimer::singleShot(0, w, [w] {
+                    setColorScheme(w);
+                    XFlush(ownDisplay());
+                });
+        } else if (e->type() == QEvent::Paint && o->isWidgetType()) {
             QWidget *window = static_cast<QWidget *>(o)->window();
             if (isLiveMainWindow(window) && static_cast<QMainWindow *>(window)->centralWidget() == o)
                 paintingWindow = window;
@@ -97,8 +149,8 @@ void setAppIcon()
 // Motif hints (_MOTIF_WM_HINTS): flags, functions, decorations, input mode,
 // status. Removes the minimize function and keeps everything else, merged
 // with whatever the window already has. Mutter, Xfwm, Openbox and most other
-// window managers then show no minimize button; KWin ignores the bit
-// (tools/kwin-plugin-rule.sh).
+// window managers then show no minimize button; KWin ignores the bit, so on
+// KDE editors keep the button and minimize with Live's main window.
 void setNoMinimize(Display *dpy, Window window)
 {
     constexpr unsigned long kHintsFunctions = 1, kFuncAll = 1, kFuncMinimize = 8;
@@ -155,7 +207,7 @@ QRect nativeWorkArea(QScreen *screen)
 {
     // Qt 5 keeps a screen's top-left in pixels and scales only its size.
     const QRect screenRect(screen->geometry().topLeft(), screen->geometry().size() * screen->devicePixelRatio());
-    static Display *dpy = XOpenDisplay(nullptr);
+    Display *dpy = ownDisplay();
     if (!dpy)
         return screenRect;
     const std::vector<long> area = rootCardinals(dpy, "_NET_WORKAREA"); // x, y, w, h per desktop
@@ -234,6 +286,62 @@ uintptr_t mainBase()
     return b;
 }
 
+// Live 12.4.7 only; tests/splash-zoom.sh checks both addresses against the
+// installed Live.
+constexpr uintptr_t kCreateWindow = 0x20e4770;
+const unsigned char kCreateWindowPrologue[] = {0x55, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
+                                               0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x28};
+constexpr uintptr_t kSplashCreateReturn = 0x21586e9;
+CreateWindowFn liveCreateWindow;
+
+// The recorded Zoom's file (splashzoom.cpp); empty: nothing is read or written.
+const std::string &splashZoomPath()
+{
+    static const std::string path = splashZoomFile(getenv("HOME"), getenv("XDG_CONFIG_HOME"));
+    return path;
+}
+
+void *createWindow(void *view, int a, void *parameters, int b, void *zoomSource, int c, ZoomRange range)
+{
+    static const uintptr_t splashReturn = mainBase() + kSplashCreateReturn;
+    const bool splash = reinterpret_cast<uintptr_t>(__builtin_return_address(0)) == splashReturn;
+    int pinned = 0;
+    void *window = createWithSplashZoom(liveCreateWindow, splash, splash ? splashZoomPath().c_str() : nullptr, view, a,
+                                        parameters, b, zoomSource, c, range, &pinned);
+    if (pinned)
+        menufixTrace("window: splash zoom %d %%\n", pinned);
+    return window;
+}
+
+// The main window whose Zoom is recorded: the first framed one painted (a
+// second main window can have its own Zoom), replaced by the next one painted
+// once it is closed or hidden, so a window shown only during startup cannot
+// keep the place. recordedZoom is the last value read or written.
+QPointer<QWidget> zoomRecordWindow;
+int recordedZoom = -1;
+
+void recordSplashZoom(QWidget *w, float zoom)
+{
+    if (liveBuild() != LiveBuild::Live12_4_7 || splashZoomPath().empty()
+        || (w->windowFlags() & Qt::FramelessWindowHint))
+        return;
+    if (!zoomRecordWindow || !zoomRecordWindow->isVisible())
+        zoomRecordWindow = w;
+    if (zoomRecordWindow != w)
+        return;
+    const int percent = qRound(zoom * 100);
+    if (percent < 50 || percent > 400 || percent == recordedZoom)
+        return;
+    if (recordedZoom < 0 && readZoomPercent(splashZoomPath().c_str()) == percent) {
+        recordedZoom = percent; // already recorded by an earlier start
+        return;
+    }
+    // Remembered even if the write fails, so a read-only folder is not retried every frame.
+    recordedZoom = percent;
+    const bool ok = writeZoomPercent(splashZoomPath().c_str(), percent);
+    menufixTrace("window: recorded zoom %d %% from a %d px wide window (%d)\n", percent, w->width(), ok);
+}
+
 } // namespace
 
 // Live calls QWidget::resize through its PLT with symbol version Qt_5; the
@@ -275,6 +383,7 @@ void liveWindowPainted(void *viewManager)
     const uint64_t minimum = reinterpret_cast<uint64_t (*)(void *)>(vtable[kMinimumSizeSlot / 8])(viewManager);
     const float scale = reinterpret_cast<float (*)(void *)>(vtable[kScaleSlot / 8])(viewManager);
     const float zoom = *reinterpret_cast<float *>(*reinterpret_cast<char **>(static_cast<char *>(viewManager) + kZoomState) + kZoom);
+    recordSplashZoom(w, zoom);
     // Live 11's menu bar is a QMainWindow menu bar above Live's view (Live 12's
     // view fills the window): the window's minimum includes it.
     QSize extra(0, 0); // a default QSize is (-1, -1)
@@ -287,6 +396,30 @@ void liveWindowPainted(void *viewManager)
         menufixTrace("window: minimum size %dx%d\n", size.width(), size.height());
         w->setMinimumSize(size);
     }
+}
+
+// Title bars of Live's windows in `band` with `text` (see the top of this
+// file). A failed write leaves the title bars as they are.
+void applyTitleBarColours(const QColor &band, const QColor &text)
+{
+    static QColor lastBand, lastText;
+    if (band == lastBand && text == lastText)
+        return;
+    Display *dpy = ownDisplay();
+    if (!dpy)
+        return;
+    const QString path = chrome::writeColorScheme(
+        QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) + "/Ableton/Window Colors", band, text);
+    if (path.isEmpty())
+        return;
+    lastBand = band;
+    lastText = text;
+    schemePath = QFile::encodeName(path);
+    for (QWidget *w : QApplication::topLevelWidgets())
+        if (decorated(w) && w->isVisible())
+            setColorScheme(w);
+    XFlush(dpy);
+    menufixTrace("window: title bar colours %06x\n", int(band.rgb() & 0xffffff));
 }
 
 void liveOwnPluginWindow(Display *dpy, Window editor)
@@ -302,8 +435,8 @@ void liveOwnPluginWindow(Display *dpy, Window editor)
                 break;
             }
     }
-    // Own instance name, so a KWin rule can match editors only
-    // (tools/kwin-plugin-rule.sh: no minimize button); same class for grouping.
+    // Own instance name, so a window rule can match editors only; same class
+    // for grouping.
     XClassHint hint = {const_cast<char *>("ableton-live-plugin"),
                         const_cast<char *>(liveBuild() == LiveBuild::Live11_3_43 ? "Ableton Live 11" : "Ableton Live 12")};
     XSetClassHint(dpy, editor, &hint);
@@ -378,9 +511,14 @@ void installWindowIntegration()
     QCoreApplication::setApplicationName(liveBuild() == LiveBuild::Live11_3_43 ? "Ableton Live 11" : "Ableton Live 12");
     setAppIcon();
     qApp->installEventFilter(new WindowFilter);
-    if (liveBuild() == LiveBuild::Live12_4_7)
+    if (liveBuild() == LiveBuild::Live12_4_7) {
         liveSetZoom = reinterpret_cast<SetZoomFn>(hookFunction(mainBase() + kSetZoom, kSetZoomPrologue,
                                                            sizeof kSetZoomPrologue, reinterpret_cast<void *>(&setZoom)));
+        liveCreateWindow = reinterpret_cast<CreateWindowFn>(hookFunction(mainBase() + kCreateWindow, kCreateWindowPrologue,
+                                                                     sizeof kCreateWindowPrologue,
+                                                                     reinterpret_cast<void *>(&createWindow)));
+        menufixTrace("window: create hook %d\n", liveCreateWindow != nullptr);
+    }
     if (liveBuild() == LiveBuild::Live11_3_43) {
         kScaleSlot = 0x5a8;
         kZoomState = 0xa0;

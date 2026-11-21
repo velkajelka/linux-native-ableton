@@ -185,10 +185,12 @@ Live finds plug-ins in the usual folders (`~/.vst3`, `/usr/lib/vst3`, `/usr/loca
 |---|---|
 | `install.sh` | The installer |
 | `shim/` | `libmenufix.so` (prebuilt) and its sources |
+| `shim/libhideexports.so` | Loaded by the launcher before Live starts (`LD_AUDIT`): keeps Live's built-in FreeType, HarfBuzz and libpng to Live, so plug-ins draw their editors with the system's. `LIVE_HIDE_EXPORTS=0` turns it off. Built from `shim/hideexports.c` |
+| `tests/` | Headless checks; `sh tests/verify.sh` builds the shim libraries, AVX-512 emulator, launchers and `make-assets` from source (Qt 5 from `tools/make-sysroot.sh`; the bundled innoextract stays prebuilt) and runs them |
 | `tools/AbletonLive12-launcher` | The launcher, prebuilt from `tools/launcher.c` (static) |
 | `tools/import-windows-content.sh` | Copies the Core Library, lessons, high-quality stem models and `Installation.cfg` (the edition: Suite) from the Suite installer |
 | `tools/make-assets` | Makes Live's cursors and icon from the Suite's files; prebuilt from `tools/make-assets.cpp`, runs on Live's bundled Qt |
-| `tools/kwin-plugin-rule.sh` | KDE: no minimize button on plug-in windows (the shim runs it) |
+| `tools/kwin-plugin-rule.sh` | KDE: removes the plug-in window rule earlier versions added, so plug-in windows minimise with Live (the shim runs it) |
 | `tools/bundled/innoextract` | innoextract 1.10-dev, which reads Live 12.4.7's installer |
 | `tools/bundled/libxkbcommon*.so.0` | xkbcommon 1.5.0 from Debian 12, used only when the system has none |
 | `tools/innoextract-compat.cpp` | Lets the bundled innoextract run on glibc 2.35 |
