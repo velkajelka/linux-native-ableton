@@ -35,6 +35,7 @@ This project is not affiliated with or endorsed by Ableton. Licensing is not tou
 - Settings > Audio > Driver Type offers **PipeWire** (default, shares the sound card with the desktop), **ALSA** (exclusive use of the card, lowest latency) and **JACK**. Each type keeps its own devices.
 - Fixed: System Default failing when the desktop has no default input; a mono microphone making Live's output mono.
 - New variables: `LIVE_AUDIO_THREADS`, `LIVE_ALSA_PERIODS`, `LIVE_ALSA_MINRING`, `LIVE_JACK_CONNECT`, `LIVE_JACK_INPUTS`, `LIVE_JACK_OUTPUTS`, `LIVE_AUDIO_DRIVERS=0`.
+- `LIVE_JACK_OUTPUTS` / `LIVE_JACK_INPUTS` now apply from the start: a multichannel card shows all its channels without switching the driver type (e.g. in the `.desktop` Exec line: `env LIVE_JACK_OUTPUTS=36 LIVE_JACK_INPUTS=36 ...`).
 
 **Push, Max for Live, themes**
 - Push 2 and Push 3 run through the Push 3 companion program, as on a standalone Push 3. The installer offers a udev rule for USB access. Not tested here (no Push hardware).

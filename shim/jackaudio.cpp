@@ -112,7 +112,8 @@ bool controlActive;
 jack_client_t *lostControl;          // the control client of a server that went away (not closed: libjack may still use it)
 std::vector<snd_pcm_t *> pcms;       // Live's open JACK PCMs
 std::vector<std::string> outPorts, inPorts; // the default device's ports
-unsigned outputs = 2, inputs = 2;    // channels shown in Live's list
+unsigned channelCount(const char *env, size_t ports);
+unsigned outputs = channelCount("LIVE_JACK_OUTPUTS", 0), inputs = channelCount("LIVE_JACK_INPUTS", 0); // patch: env vars from start
 
 // One of the plugin's clients: its process callback, and the cycle it last ran in.
 struct Tap {
