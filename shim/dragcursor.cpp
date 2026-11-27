@@ -15,6 +15,15 @@
 // learnt from Live's XcursorFilenameLoadCursor calls. Addresses are for Live
 // 12.4.7; the slot is left alone if it does not hold the expected pointer.
 //
+// Drags from other programs (files from a file manager): the clip and its
+// waveform follow the pointer in the arrangement while the drag is over it,
+// with Shift / Ctrl / Alt as the drop takes them, as for Live's own drags;
+// before, the clip appeared only after the drop. Live 12.4.7 only, and only
+// when the code the shim calls matches this build (first bytes compared);
+// otherwise moves behave as before. The no-drop check above applies to Live's
+// own drags only: drags from other programs accept every move, as before, so
+// their drops still arrive.
+//
 // Where a drop is allowed, Qt shows the theme's dnd-move cursor (a closed hand
 // in Breeze). Live's only drag (QDrag::exec at 0x1ff2796) instead gets the
 // Windows move cursor: the theme's arrow with a small box below it.
@@ -62,6 +71,7 @@
 #include <QDragMoveEvent>
 #include <QGuiApplication>
 #include <QHash>
+#include <QMimeData>
 #include <QImage>
 #include <QPainter>
 #include <QPixmap>
@@ -72,6 +82,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <dlfcn.h>
@@ -88,6 +99,22 @@ namespace {
 
 constexpr uintptr_t kDragMoveSlot = 0x945d508; // TQtView vtable, dragMoveEvent
 constexpr uintptr_t kDragMoveEvent = 0x1ff30f0;
+// Drags from other programs, Live 12.4.7 (see the header):
+constexpr uintptr_t kInternalDrag = 0x9c0e548;
+constexpr uintptr_t kViewDragFiles = 0x58;
+constexpr uintptr_t kViewDragTarget = 0x140;
+constexpr uintptr_t kBusy = 0x20b7450;
+constexpr uintptr_t kDragModifiers = 0x1bfee40;
+constexpr uintptr_t kDragMoveTo = 0x1ffa920;
+struct CodeCheck {
+    uintptr_t address;
+    const char *bytes; // expected first bytes, hex
+};
+constexpr CodeCheck kOutsideDragCode[] = {
+    {kBusy, "0fb6058be2b507c3"},
+    {kDragModifiers, "508d470485f60f44c78d700285d20f44"},
+    {kDragMoveTo, "554157415641554154534883ec384989"},
+};
 constexpr uintptr_t kBlankCursorReturn = 0x1fe4e1b; // after Live's XCreatePixmapCursor call
 // Live 11.3.43: the blank cursor is made at 0x1b8e96b (in 0x1b8e490, Live 12's
 // 0x1fe49f0). Its internal drags (browser item onto a track, clips, devices)
@@ -106,6 +133,8 @@ Cursor blankCursor;         // Live's hidden cursor
 bool liveHidden;            // Live's last XDefineCursor set blankCursor
 Display *liveDisplay;       // the display Live loads its cursors on
 bool inLiveDrag;            // inside Live's QDrag::exec
+uintptr_t liveBase;         // main executable's load address
+bool passOutsideMoves;      // drags from other programs: the clip preview follows the pointer
 Atom xdndSelection;
 
 struct Cookie {
@@ -188,11 +217,50 @@ void skipDragSelection()
         menufixTrace("dragcursor: XdndSelection not skipped\n");
 }
 
+// A move of a drag from another program that Live accepted: the clip
+// preview follows it, as for Live's own drags.
+void passOutsideMove(QWidget *view, QDragMoveEvent *event)
+{
+    if (!passOutsideMoves || !event->isAccepted() || !event->mimeData() || !event->mimeData()->hasUrls())
+        return;
+    if (*reinterpret_cast<void *const *>(liveBase + kInternalDrag))
+        return;
+    auto *bytes = reinterpret_cast<const unsigned char *>(view);
+    if (!bytes[kViewDragFiles])
+        return;
+    if (reinterpret_cast<unsigned char (*)()>(liveBase + kBusy)())
+        return;
+    const QPoint pos = event->posF().toPoint();
+    const Qt::KeyboardModifiers m = event->keyboardModifiers();
+    const int mods = reinterpret_cast<int (*)(bool, bool, bool)>(liveBase + kDragModifiers)(
+        m & Qt::ShiftModifier, m & Qt::ControlModifier, m & Qt::AltModifier);
+    reinterpret_cast<void (*)(void *, const QPoint *, const int *)>(liveBase + kDragMoveTo)(
+        reinterpret_cast<char *>(view) + kViewDragTarget, &pos, &mods);
+}
+
 void dragMoveHook(QWidget *view, QDragMoveEvent *event)
 {
     liveDragMove(view, event);
+    if (!inLiveDrag && passOutsideMoves) {
+        passOutsideMove(view, event);
+        return;
+    }
     if (event->isAccepted() && noDropCursors.contains(liveCursor))
         event->ignore();
+}
+
+// Whether the code at each address starts with the bytes this build has.
+bool outsideDragCodeMatches(uintptr_t base)
+{
+    for (const CodeCheck &c : kOutsideDragCode) {
+        const auto *code = reinterpret_cast<const unsigned char *>(base + c.address);
+        for (size_t i = 0; c.bytes[2 * i]; ++i) {
+            unsigned int byte = 0;
+            if (sscanf(c.bytes + 2 * i, "%2x", &byte) != 1 || code[i] != byte)
+                return false;
+        }
+    }
+    return true;
 }
 
 template <typename Fn> Fn xcursor(const char *name)
@@ -449,6 +517,10 @@ void installDragCursor()
         return;
     }
     liveDragMove = reinterpret_cast<DragMoveFn>(base + kDragMoveEvent);
+    liveBase = base;
+    passOutsideMoves = outsideDragCodeMatches(base);
+    menufixTrace(passOutsideMoves ? "dragcursor: outside-drag moves passed on\n"
+                                  : "dragcursor: outside-drag moves not passed on\n");
     const long page = sysconf(_SC_PAGESIZE);
     auto *start = reinterpret_cast<void *>(uintptr_t(slot) & ~uintptr_t(page - 1));
     if (mprotect(start, page, PROT_READ | PROT_WRITE) != 0) {

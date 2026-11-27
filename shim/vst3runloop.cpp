@@ -11,6 +11,12 @@
 // else goes to Live's original function. Addresses are for Live 12.4.7
 // (Push 3 2.4.7, BuildID 0e5b75d8...); the patch is skipped if a slot does
 // not hold the expected pointer.
+//
+// Factory host context: plug-ins such as Serum 2 take the host's IRunLoop
+// only from the context given to IPluginFactory3::setHostContext() (without
+// it Serum 2 shows "Your DAW is not compatible"). On Live 12.4.7 the shim
+// hands each IPluginFactory3 factory the Qt run loop as its host context when
+// the plug-in's module is loaded.
 #include "livebuild.h"
 #include <QCoreApplication>
 #include <QGuiApplication>
@@ -24,6 +30,7 @@
 #include <cstring>
 #include <link.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 void menufixTrace(const char *fmt, int a = 0, int b = 0, int c = 0);
@@ -45,6 +52,8 @@ constexpr unsigned char kFUnknownIID[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
                                             0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46};
 constexpr unsigned char kIRunLoopIID[16] = {0x18, 0xC3, 0x53, 0x66, 0x97, 0x76, 0x4F, 0x1A,
                                             0x9C, 0x5B, 0x83, 0x85, 0x7A, 0x87, 0x13, 0x89};
+constexpr unsigned char kIPluginFactory3IID[16] = {0x45, 0x55, 0xA2, 0xAB, 0xC1, 0x23, 0x4E, 0x57,
+                                                  0x9B, 0x12, 0x29, 0x10, 0x36, 0x87, 0x89, 0x31};
 constexpr unsigned char kIPlugViewContentScaleSupportIID[16] = {0x65, 0xED, 0x96, 0x90, 0x8A, 0xC4, 0x45, 0x25,
                                                                 0x8A, 0xAD, 0xEF, 0x7A, 0x72, 0xEA, 0x70, 0x3F};
 
@@ -64,6 +73,18 @@ struct ITimerHandler : FUnknown {
 
 struct IPlugViewContentScaleSupport : FUnknown {
     virtual tresult setContentScaleFactor(float factor) = 0;
+};
+
+// IPluginFactory3 (VST3 SDK) up to setHostContext; the class-info arguments
+// are not used here.
+struct IPluginFactory3 : FUnknown {
+    virtual tresult getFactoryInfo(void *info) = 0;
+    virtual int32_t countClasses() = 0;
+    virtual tresult getClassInfo(int32_t index, void *info) = 0;
+    virtual tresult createInstance(const char *cid, const char *iid, void **obj) = 0;
+    virtual tresult getClassInfo2(int32_t index, void *info) = 0;
+    virtual tresult getClassInfoUnicode(int32_t index, void *info) = 0;
+    virtual tresult setHostContext(FUnknown *context) = 0;
 };
 
 struct IRunLoop : FUnknown {
@@ -238,11 +259,44 @@ void *createView(void **out, void *plugin)
 } // namespace
 
 void *hookFunction(uintptr_t fn, const unsigned char *prologue, size_t len, void *replacement); // hook.cpp
+bool redirectFunction(uintptr_t fn, const unsigned char *prologue, size_t len, void *target);    // hook.cpp
 
 // The Qt run loop as Steinberg::Linux::IRunLoop, for vst3window11.cpp's IPlugFrame.
 void *qtRunLoop()
 {
     return static_cast<IRunLoop *>(&runLoop);
+}
+
+// Keeps a newly loaded module's factory (*dst = *src and one addRef), then
+// gives it the host context.
+void *vst3CopyFactoryPointer(void **dst, void *const *src)
+{
+    *dst = *src;
+    auto *factory = static_cast<FUnknown *>(*dst);
+    if (!factory)
+        return dst;
+    factory->addRef();
+    void *obj = nullptr;
+    if (factory->queryInterface(reinterpret_cast<const char *>(kIPluginFactory3IID), &obj) == kResultOk && obj) {
+        auto *factory3 = static_cast<IPluginFactory3 *>(obj);
+        const tresult r = factory3->setHostContext(static_cast<FUnknown *>(static_cast<IRunLoop *>(&runLoop)));
+        factory3->release();
+        // The main thread (Qt's GUI thread in Live), checked without asking Qt,
+        // which would make a QThread object for a thread it does not know.
+        const bool gui = syscall(SYS_gettid) == getpid();
+        menufixTrace("runloop: factory host context -> %d (gui thread %d)\n", r, gui);
+    }
+    return dst;
+}
+
+// Installs vst3CopyFactoryPointer in Live 12.4.7 loaded at `base` when the
+// code there matches this build; false, and nothing changed, otherwise.
+bool installFactoryHostContext(uintptr_t base)
+{
+    static const unsigned char kCopyFactory[] = {0x48, 0x89, 0xf8, 0x48, 0x8b, 0x3e, 0x48, 0x89, 0x38, 0x48, 0x85,
+                                                 0xff, 0x74, 0x06, 0x48, 0x8b, 0x07, 0xff, 0x60, 0x08, 0xc3};
+    return redirectFunction(base + 0x5a032d0, kCopyFactory, sizeof kCopyFactory,
+                            reinterpret_cast<void *>(&vst3CopyFactoryPointer));
 }
 
 void installVst3RunLoop()
@@ -267,6 +321,7 @@ void installVst3RunLoop()
         mprotect(pageStart, page, PROT_READ);
         menufixTrace("runloop: patched IPlugFrame slot %d\n", i);
     }
+    menufixTrace("runloop: factory host context hook %d\n", installFactoryHostContext(base));
     scaleEditors = qEnvironmentVariable("LIVE_PLUGIN_SCALE") != QLatin1String("0");
     liveCreateView = reinterpret_cast<CreateViewFn>(hookFunction(base + kCreateView, kCreateViewPrologue,
                                                                  sizeof kCreateViewPrologue, reinterpret_cast<void *>(&createView)));

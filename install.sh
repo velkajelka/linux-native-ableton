@@ -416,7 +416,7 @@ $(printf '         %s\n' "${found[@]##*/}")"
 }
 PUSH_ZIP=$(find_zip "Push 3 recovery image for Live $LIVE_MAJOR" "$PUSH_GLOB" "$PUSH_SKIP")
 SUITE_ZIP=$(find_zip "Live $LIVE_MAJOR Suite installer" "$SUITE_GLOB" "$SUITE_SKIP")
-[ -f "$SCRIPT_DIR/shim/libmenufix.so" ] && [ -f "$SCRIPT_DIR/shim/libpathfix.so" ] && [ -f "$SCRIPT_DIR/shim/libswupdate.so.0.1" ] && [ -f "$SCRIPT_DIR/tools/AbletonLive$LIVE_MAJOR-launcher" ] ||
+[ -f "$SCRIPT_DIR/shim/libmenufix.so" ] && [ -f "$SCRIPT_DIR/shim/libpathfix.so" ] && [ -f "$SCRIPT_DIR/shim/libhideexports.so" ] && [ -f "$SCRIPT_DIR/shim/libswupdate.so.0.1" ] && [ -f "$SCRIPT_DIR/tools/AbletonLive$LIVE_MAJOR-launcher" ] ||
     die "shim/ and tools/ must be next to install.sh (keep the folder as it came)"
 # Normal or portable: --portable, else asked when no --prefix was given.
 if [ $INTERACTIVE = 1 ] && [ $PORTABLE = 0 ] && [ $PREFIX_SET = 0 ]; then
@@ -725,6 +725,9 @@ cp "$MODS/shim/libmenufix.so" "$PREFIX/shim/"
 # The launcher preloads it when the install path has a hidden folder (the default
 # ~/.local/share/...): otherwise Live does not index its built-in devices.
 cp "$MODS/shim/libpathfix.so" "$PREFIX/shim/"
+# The launcher loads it as an audit module: it keeps Live's built-in FreeType,
+# HarfBuzz and libpng to Live, so plug-in editors get the system's.
+cp "$MODS/shim/libhideexports.so" "$PREFIX/shim/"
 # The Push 3 companion (Push3), which Live starts when Push hardware is connected, links
 # the Push OS update library; the image has it only in the device's system partition and
 # it waits forever for the device's update service. A stand-in that reports "no update

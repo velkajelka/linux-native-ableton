@@ -588,7 +588,7 @@ private:
             return;
         for (unsigned i = 0; i < count; ++i) {
             XWindowAttributes child;
-            if (!XGetWindowAttributes(display, kids[i], &child) || child.map_state == IsUnmapped)
+            if (!XGetWindowAttributes(display, kids[i], &child) || child.map_state == IsUnmapped || child.c_class == InputOnly)
                 continue;
             if (child.width != outer.width || child.height != outer.height) {
                 menufixTrace("vst3window: editor 0x%x fitted to its view, %dx", int(window), child.width);

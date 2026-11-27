@@ -54,6 +54,8 @@
 // window, then onSize. A plug-in that cannot resize gets its own size back.
 // Addresses are for Live 12.4.7 (Push 3 2.4.7); the hook is skipped if the
 // thunk does not hold the expected bytes.
+#include "editorcolour.h"
+#include "editorplacement.h"
 #include "livebuild.h"
 #include <QHash>
 #include <QTimer>
@@ -69,6 +71,9 @@
 void menufixTrace(const char *fmt, int a = 0, int b = 0, int c = 0);
 void *nextSymbol(const char *name, const char *version); // embedded.cpp
 void liveOwnPluginWindow(Display *dpy, Window editor); // window.cpp
+void editorShown(Display *dpy, Window editor);         // window.cpp
+void editorKeysEvent(Display *dpy, const XEvent &ev);  // window.cpp
+void editorKeysForget(Window editor);                  // window.cpp
 
 // VST3 IPlugView (pluginterfaces/gui/iplugview.h), only what is called here.
 // Not in the anonymous namespace: GCC would then know that nothing in this
@@ -322,7 +327,7 @@ void fitToView(Display *dpy, Window w)
         return;
     for (unsigned i = 0; i < count; ++i) {
         XWindowAttributes view;
-        if (!XGetWindowAttributes(dpy, kids[i], &view) || view.map_state == IsUnmapped)
+        if (!XGetWindowAttributes(dpy, kids[i], &view) || view.map_state == IsUnmapped || view.c_class == InputOnly)
             continue;
         if (view.width != outer.width || view.height != outer.height) {
             menufixTrace("pluginclose: editor 0x%x fitted to its view, ", int(w));
@@ -345,8 +350,10 @@ void maxViewForget(Window w);
 extern "C" int XMoveResizeWindow(Display *dpy, Window w, int x, int y, unsigned width, unsigned height)
 {
     static auto real = next<decltype(&XMoveResizeWindow)>("XMoveResizeWindow");
+    editorColourResized(w); // editors only (window.cpp tracks them), Live 11 and 12
     if (maxViewMoveResize(dpy, w, x, y, width, height, __builtin_return_address(0)))
         return real(dpy, w, x, y, width, height);
+    editorPlacementResizing(dpy, w, x, y); // shown editors only: kept where they are
     if (!windowProps.contains(w))
         return real(dpy, w, x, y, width, height);
     fitSizeHints(dpy, w, width, height);
@@ -364,6 +371,8 @@ extern "C" int XMapWindow(Display *dpy, Window w)
     }
     if (windowProps.contains(w))
         fitToView(dpy, w);
+    editorPlacementMapping(dpy, w); // editors only (window.cpp tracks them)
+    editorColourMapped(w); // editors only (window.cpp tracks them)
     return real(dpy, w);
 }
 
@@ -371,6 +380,7 @@ extern "C" int XUnmapWindow(Display *dpy, Window w)
 {
     static auto real = next<decltype(&XUnmapWindow)>("XUnmapWindow");
     maxViewUnmapped(w, __builtin_return_address(0));
+    editorPlacementSave(dpy, w); // while still shown
     if (!windowProps.contains(w))
         return real(dpy, w);
     pendingUnmaps.insert(w, dpy);
@@ -396,6 +406,7 @@ extern "C" void XSetWMNormalHints(Display *dpy, Window w, XSizeHints *hints)
 extern "C" int XResizeWindow(Display *dpy, Window w, unsigned width, unsigned height)
 {
     static auto real = next<decltype(&XResizeWindow)>("XResizeWindow");
+    editorColourResized(w);
     if (!windowProps.contains(w))
         return real(dpy, w, width, height);
     fitSizeHints(dpy, w, width, height);
@@ -403,10 +414,22 @@ extern "C" int XResizeWindow(Display *dpy, Window w, unsigned width, unsigned he
     return real(dpy, w, width, height);
 }
 
+extern "C" int XStoreName(Display *dpy, Window w, const char *name)
+{
+    static auto real = next<decltype(&XStoreName)>("XStoreName");
+    const int r = real(dpy, w, name);
+    editorColourNamed(w, name); // editors only (window.cpp tracks them)
+    return r;
+}
+
 extern "C" int XDestroyWindow(Display *dpy, Window w)
 {
     static auto real = next<decltype(&XDestroyWindow)>("XDestroyWindow");
     maxViewForget(w);
+    editorKeysForget(w);
+    editorPlacementSave(dpy, w); // needs the plug-in's name, which editorColourForget drops
+    editorPlacementForget(w);
+    editorColourForget(w);
     windowProps.remove(w);
     pendingUnmaps.remove(w);
     editors.remove(w);
@@ -418,6 +441,9 @@ extern "C" int XNextEvent(Display *dpy, XEvent *ev)
     static auto real = next<decltype(&XNextEvent)>("XNextEvent");
     const int r = real(dpy, ev);
     if (ev->type == ConfigureNotify && ev->xconfigure.window == ev->xconfigure.event) {
+        // Editors of Live 11 and 12 (window.cpp tracks them); others are ignored.
+        editorColourConfigured(ev->xconfigure.window, ev->xconfigure.width, ev->xconfigure.height);
+        editorPlacementConfigured(ev->xconfigure.window);
         auto it = editors.find(ev->xconfigure.window);
         if (it != editors.end()) {
             it->wantWidth = ev->xconfigure.width;
@@ -430,6 +456,9 @@ extern "C" int XNextEvent(Display *dpy, XEvent *ev)
             }
         }
     }
+    if (ev->type == MapNotify && ev->xmap.window == ev->xmap.event)
+        editorShown(dpy, ev->xmap.window); // editors only
+    editorKeysEvent(dpy, *ev); // editors only: keys to Live
     if (ev->type == ClientMessage && wmDeleteWindow && ev->xclient.message_type == wmProtocols
         && Atom(ev->xclient.data.l[0]) == wmDeleteWindow && windowProps.contains(ev->xclient.window)) {
         const Window w = ev->xclient.window;

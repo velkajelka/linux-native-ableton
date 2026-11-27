@@ -12,6 +12,8 @@
 #include <QTimer>
 #include <QRect>
 #include <QWidget>
+#include <QWindow>
+#include <QGuiApplication>
 #include <dlfcn.h>
 #include <climits>
 #include <cstdio>
@@ -21,7 +23,7 @@
 // Keep the preload out of Live's child processes (sh, lspci, helpers), except
 // the AVX-512 emulator (libavx512emu.so): on CPUs without AVX-512 the launcher
 // preloads it, and Live's helpers (Ableton Index, Plugin Scanner, XPython3Exe)
-// need it as much as Live does.
+// need it as much as Live does. dropAudit (below) does the same for LD_AUDIT.
 __attribute__((constructor)) static void dropPreload()
 {
     // Child processes keep the AVX-512 emulator and libpathfix.so (tools/launcher.c),
@@ -50,6 +52,33 @@ __attribute__((constructor)) static void dropPreload()
         unsetenv("LD_PRELOAD");
 }
 
+// The launcher's audit module (shim/hideexports.c) is only for Live itself:
+// drop it from LD_AUDIT, keeping any other entries. Priority 101, so this runs
+// before standalone.cpp's setUpEnvironment (102) starts the first helper.
+__attribute__((constructor(101))) static void dropAudit()
+{
+    if (const char *audit = getenv("LD_AUDIT")) {
+        char rest[4 * PATH_MAX] = "";
+        size_t used = 0;
+        for (const char *p = audit; *p;) {
+            const char *end = p + strcspn(p, ":");
+            const size_t n = static_cast<size_t>(end - p);
+            if (n && !memmem(p, n, "libhideexports.so", 17) && used + n + 2 < sizeof rest) {
+                if (used)
+                    rest[used++] = ':';
+                memcpy(rest + used, p, n);
+                used += n;
+                rest[used] = '\0';
+            }
+            p = *end ? end + 1 : end;
+        }
+        if (used)
+            setenv("LD_AUDIT", rest, 1);
+        else
+            unsetenv("LD_AUDIT");
+    }
+}
+
 // MENUFIX_DEBUG=<file> appends a trace there (Live redirects stderr).
 void menufixTrace(const char *fmt, int a, int b, int c)
 {
@@ -69,6 +98,7 @@ void installFrameBufferHook();
 void installNativeMenu();
 void installWindowIntegration();
 void installFileDialogs();
+void installShowInFolder();
 void installDragCursor();
 void installSleepInhibit();
 void installPointerWarp();
@@ -98,6 +128,35 @@ void closeMenus()
     for (const auto &w : menus)
         if (w && isMenuWindow(w))
             w->close();
+}
+
+
+// Qt blocks the mouse for every window that is not linked to an open
+// application-modal window (Export Audio/Video). A list's frame is exempt as a
+// tool tip, but the child window the pointer lands on is not, and nothing links
+// the list to the dialog, so its hovers and clicks were dropped. Link the list
+// to the modal window and have Qt re-evaluate it and its child windows.
+void linkToModal(QWidget *w)
+{
+    QWindow *modal = QGuiApplication::modalWindow();
+    QWindow *list = w->windowHandle();
+    if (!modal || !list || modal->isAncestorOf(list, QWindow::IncludeTransients))
+        return;
+    using UpdateBlocked = void (*)(QWindow *);
+    static const auto updateBlocked = reinterpret_cast<UpdateBlocked>(dlvsym(RTLD_DEFAULT,
+        "_ZN22QGuiApplicationPrivate19updateBlockedStatusEP7QWindow", "Qt_5_PRIVATE_API"));
+    if (!updateBlocked) { // without the refresh the link alone does not help: change nothing
+        static bool warned = false;
+        if (!warned)
+            trace("modal-list: no blocked-status refresh in this Qt\n");
+        warned = true;
+        return;
+    }
+    list->setTransientParent(modal);
+    updateBlocked(list);
+    for (QWindow *child : list->findChildren<QWindow *>())
+        updateBlocked(child);
+    trace("modal-list win=%x\n", int(quintptr(w) & 0xffffff));
 }
 
 class MenuCloser : public QObject {
@@ -152,6 +211,7 @@ public:
             trace("show %d,%d fromMenu=%d", pos.x(), pos.y(), fromMenu);
             trace(" win=%x geo=%dx%d", int(quintptr(w) & 0xffffff), w->width(), w->height());
             trace("+%d+%d\n", w->x(), w->y());
+            linkToModal(w);
             if (!fromMenu && w->geometry() == toggled && toggleClock.isValid()
                 && toggleClock.elapsed() < 300) {
                 trace("toggle-close x=%d\n", w->x());
@@ -245,6 +305,7 @@ static void installMenuCloser()
     installNativeMenu();
     installWindowIntegration();
     installFileDialogs();
+    installShowInFolder();
     installDragCursor();
     installSleepInhibit();
     installPointerWarp();

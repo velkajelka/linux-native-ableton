@@ -12,6 +12,10 @@
 //     Push 3's Tiger Lake), also preloads the AVX-512 emulator
 //     (../../shim/libavx512emu.so), which translates those instructions to
 //     AVX2 as they are reached. LIVE_AVX512EMU=1 forces it, =0 turns it off;
+//   - loads ../../shim/libhideexports.so as a loader audit module (LD_AUDIT,
+//     by full path), which keeps Live's built-in FreeType, HarfBuzz and libpng
+//     to Live, so plug-ins and system libraries get the system's
+//     (shim/hideexports.c). LIVE_HIDE_EXPORTS=0 turns it off;
 //   - adds push3_opt/push3/lib and compat_lib to LD_LIBRARY_PATH: Live's own
 //     RPATH covers lib/ only, and the loader needs FFmpeg 5 and ICU 70 (Live
 //     11: FFmpeg 58, ICU 66, OpenSSL 1.1) from compat_lib before the shim runs;
@@ -22,7 +26,13 @@
 //     ($XDG_RUNTIME_DIR/ableton-live-<hash>) and preloads shim/libpathfix.so:
 //     Live and its indexer skip content in hidden folders, which left the
 //     browser's built-in device categories empty (shim/pathfix.c).
-//     LIVE_PATHFIX=0 turns this off.
+//     LIVE_PATHFIX=0 turns this off;
+//   - when Plasma started it (its systemd user unit is app-ableton...service
+//     or .scope), keeps that unit out of swap (MemorySwapMax=0, for this run
+//     only). Linux swaps out a Live left minimised a while, and bringing it
+//     back then waited on reading it in again: the window showed empty for a
+//     second. Live's child processes (the hosts of Windows plug-ins) share the
+//     unit. Started any other way, nothing changes.
 // Live asks for the loader at /lib/ld-linux-x86-64.so.2, the Push's path.
 // Arch has it; Debian, Ubuntu, Mint and Fedora only have
 // /lib64/ld-linux-x86-64.so.2, and need a link (shown in a dialog if missing).
@@ -30,6 +40,7 @@
 // Built static (tools/build-launchers.sh), so the launcher itself needs no
 // loader and no particular glibc.
 #define _GNU_SOURCE
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -149,9 +160,47 @@ static void prepend(const char *name, const char *first)
     free(value);
 }
 
+// MemorySwapMax=0 on the systemd user unit Plasma started this process in
+// (see the header). Waits for systemctl, so the limit is in place before Live
+// allocates. Any failure leaves everything as it is.
+static void keep_out_of_swap(void)
+{
+    char line[4096];
+    char *unit = NULL;
+    FILE *f = fopen("/proc/self/cgroup", "r");
+    if (!f)
+        return;
+    while (fgets(line, sizeof line, f))
+        if (!strncmp(line, "0::", 3)) {
+            line[strcspn(line, "\n")] = '\0';
+            unit = strrchr(line, '/');
+            break;
+        }
+    fclose(f);
+    if (!unit || strncmp(++unit, "app-ableton", 11) != 0)
+        return;
+    const size_t n = strlen(unit);
+    if (!(n > 8 && !strcmp(unit + n - 8, ".service")) && !(n > 6 && !strcmp(unit + n - 6, ".scope")))
+        return;
+    const pid_t pid = fork();
+    if (pid == 0) {
+        const int null = open("/dev/null", O_RDWR);
+        if (null >= 0) {
+            dup2(null, 0);
+            dup2(null, 1);
+            dup2(null, 2);
+        }
+        execlp("systemctl", "systemctl", "--user", "set-property", "--runtime", unit, "MemorySwapMax=0", (char *)NULL);
+        _exit(127);
+    }
+    if (pid > 0)
+        waitpid(pid, NULL, 0);
+}
+
 int main(int argc, char **argv)
 {
     (void)argc;
+    keep_out_of_swap(); // before any preload variable is set: systemctl gets none
     char app[PATH_MAX];
     const ssize_t n = readlink("/proc/self/exe", app, sizeof app - 1);
     if (n <= 0) {
@@ -210,6 +259,14 @@ int main(int argc, char **argv)
             return 1;
         }
     }
+
+    // Keeps Live's built-in FreeType, HarfBuzz and libpng to Live itself
+    // (shim/hideexports.c). By full path: the loader opens it before any chdir.
+    const char *hide = getenv("LIVE_HIDE_EXPORTS");
+    char audit[PATH_MAX + 32];
+    snprintf(audit, sizeof audit, "%s/shim/libhideexports.so", root);
+    if (!(hide && !strcmp(hide, "0")) && access(audit, R_OK) == 0)
+        prepend("LD_AUDIT", audit);
 
     const char *force = getenv("LIVE_AVX512EMU");
     const int level = cpu_level();

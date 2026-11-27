@@ -23,8 +23,9 @@
 //     XDG_DATA_HOME and XDG_CACHE_HOME point into the data folder too;
 //   - LD_LIBRARY_PATH for Live's helper programs (Ableton Index, Plugin
 //     Scanner, Web Connector), which have no RPATH of their own;
-//   - the KWin rule for plug-in editors (tools/kwin-plugin-rule.sh), run in
-//     the background with the real HOME;
+//   - tools/kwin-plugin-rule.sh, which removes the KWin rule for plug-in
+//     editors that earlier versions added, run in the background with the
+//     real HOME;
 //   - the working directory: push3_opt/push3, as the launcher had it.
 // Variables that are already set (by the launcher, or by the user) are kept,
 // except the Qt paths, which must point at the bundled Qt.

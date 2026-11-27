@@ -18,16 +18,21 @@
 // LIVE_NATIVE_MENU=0 turns it off.
 //
 // Addresses are file-relative virtual addresses in AbletonLive12 (PIE).
+#include "chrome.h"
 #include "livebuild.h"
 #include <QApplication>
+#include <QFileInfo>
+#include <QFontInfo>
 #include <QFontMetrics>
 #include <QMainWindow>
 #include <QMenu>
 #include <QMenuBar>
+#include <QPainter>
 #include <QPointer>
 #include <QLayout>
 #include <QResizeEvent>
 #include <QTimer>
+#include <QtMath>
 #include <QVariant>
 #include <link.h>
 #include <sys/mman.h>
@@ -39,6 +44,7 @@
 #include <cstring>
 
 void menufixTrace(const char *fmt, int a = 0, int b = 0, int c = 0);
+void applyTitleBarColours(const QColor &band, const QColor &text); // window.cpp
 
 namespace {
 
@@ -219,11 +225,65 @@ QString dynamicTitle(int id)
 
 void fillMenu(QMenu *menu);
 
+// The drop-down menus' style (chrome.h), shared by every menu; restyle() keeps
+// its colours and sizes on Live's theme and band.
+chrome::MenuStyle *menuStyle()
+{
+    static auto *style = new chrome::MenuStyle;
+    return style;
+}
+
+// Live's menu font, from the installed Live next to the executable; empty
+// when it cannot be loaded (the menus and the bar keep their font then).
+QString menuFontFamily()
+{
+    static const QString family = [] {
+        const QString exe = QFileInfo(QStringLiteral("/proc/self/exe")).canonicalFilePath();
+        const QString f = chrome::loadFontFamily(QFileInfo(exe).absolutePath()
+                                                 + QStringLiteral("/products/push3/assets/fonts/AbletonSansSmall-Regular.otf"));
+        menufixTrace("nativemenu: Live's menu font loaded %d\n", !f.isEmpty());
+        return f;
+    }();
+    return family;
+}
+
+// Live's menu text: 10 px at 100 % in Live's font (capitals 7 px, as Live's
+// own menus), else the fallback size.
+QFont menuFont(QFont font)
+{
+    const QString family = menuFontFamily();
+    if (family.isEmpty()) {
+        font.setPixelSize(menuStyle()->look.fontPixels);
+        return font;
+    }
+    font.setFamily(family);
+    font.setPixelSize(qMax(1, qRound(10 * menuStyle()->look.unit)));
+    return font;
+}
+
+// Traces whether `widget` draws in Live's menu font (its resolved font), as
+// "<trace> 1" or "<trace> 0", once and again when that changes (`last`).
+void traceInLiveFont(const char *trace, int &last, QWidget *widget)
+{
+    const QString family = menuFontFamily();
+    const int inLive = !family.isEmpty() && QFontInfo(widget->font()).family() == family;
+    if (inLive != last)
+        menufixTrace(trace, inLive);
+    last = inLive;
+}
+
 QMenu *addSubmenu(QWidget *parent, const QString &title, const QVariantList &path)
 {
     auto *menu = new QMenu(QString(title).replace('&', "&&"), parent);
     menu->setProperty("livePath", path);
-    QObject::connect(menu, &QMenu::aboutToShow, menu, [menu] { fillMenu(menu); });
+    chrome::placeSubmenus(menu);
+    menu->setStyle(menuStyle());
+    QObject::connect(menu, &QMenu::aboutToShow, menu, [menu] {
+        menu->setFont(menuFont(menu->font()));
+        static int menuInLive = -1;
+        traceInLiveFont("nativemenu: drop-down in Live's menu font %d\n", menuInLive, menu);
+        fillMenu(menu);
+    });
     return menu;
 }
 
@@ -360,6 +420,7 @@ constexpr int kDesktop = 3;
 constexpr int kSurfaceBackground = 6;
 constexpr int kControlForeground = 11;
 constexpr int kTextDisabled = 212;
+constexpr int kMenuBackground = 51; // Live's own context menus
 
 // Change notifications. Whenever ATheme recomputes its colour table (a theme
 // switch, every brightness, colour intensity, hue or grid change), it then
@@ -401,60 +462,37 @@ struct ThemeColours {
 bool liveColours; // GetTheme and GetColor are the expected code
 bool themeHooked; // restyle on Live's theme changes
 
-ThemeColours themeColours()
+QColor themeColour(int id)
 {
     void *theme = live<void *(*)()>(kGetTheme)();
-    auto colour = [theme](int id) {
-        if (liveBuild() == LiveBuild::Live11_3_43) {
-            QRgb argb = 0;
-            live<void (*)(QRgb *, void *, int)>(kGetColor)(&argb, theme, id);
-            return QColor::fromRgb(argb);
-        }
-        return QColor::fromRgb(live<QRgb (*)(void *, int)>(kGetColor)(theme, id));
-    };
-    return {colour(kDesktop), colour(kSurfaceBackground), colour(kControlForeground), colour(kTextDisabled)};
-}
-
-// WCAG contrast ratio, 1 (same) to 21 (black on white).
-double luminance(const QColor &c)
-{
-    auto channel = [](int v) {
-        const double x = v / 255.0;
-        return x <= 0.03928 ? x / 12.92 : std::pow((x + 0.055) / 1.055, 2.4);
-    };
-    return 0.2126 * channel(c.red()) + 0.7152 * channel(c.green()) + 0.0722 * channel(c.blue());
-}
-
-double contrast(const QColor &a, const QColor &b)
-{
-    const double la = luminance(a), lb = luminance(b);
-    return (qMax(la, lb) + 0.05) / (qMin(la, lb) + 0.05);
-}
-
-QColor mix(const QColor &a, const QColor &b, double t)
-{
-    return QColor::fromRgbF(a.redF() + (b.redF() - a.redF()) * t, a.greenF() + (b.greenF() - a.greenF()) * t,
-                            a.blueF() + (b.blueF() - a.blueF()) * t);
-}
-
-// Black or white, whichever stands out more on `back`.
-QColor extreme(const QColor &back)
-{
-    return contrast(Qt::black, back) >= contrast(Qt::white, back) ? QColor(Qt::black) : QColor(Qt::white);
-}
-
-// `c`, moved towards `towards` just far enough to reach `ratio` against `back`.
-QColor withContrast(const QColor &c, const QColor &back, const QColor &towards, double ratio)
-{
-    for (int i = 0; i <= 20; ++i) {
-        const QColor m = mix(c, towards, i / 20.0);
-        if (contrast(m, back) >= ratio)
-            return m;
+    if (liveBuild() == LiveBuild::Live11_3_43) {
+        QRgb argb = 0;
+        live<void (*)(QRgb *, void *, int)>(kGetColor)(&argb, theme, id);
+        return QColor::fromRgb(argb);
     }
-    return towards;
+    return QColor::fromRgb(live<QRgb (*)(void *, int)>(kGetColor)(theme, id));
 }
 
-QString styleFor(int bandHeight)
+ThemeColours themeColours()
+{
+    return {themeColour(kDesktop), themeColour(kSurfaceBackground), themeColour(kControlForeground),
+            themeColour(kTextDisabled)};
+}
+
+using chrome::extreme;
+using chrome::mix;
+using chrome::withContrast;
+
+// Text colour of the menu bar, readable on the band.
+QColor barTextColour(const ThemeColours &theme)
+{
+    const QColor text = withContrast(theme.text, theme.surface, extreme(theme.surface), 7.0);
+    return withContrast(text, theme.band, extreme(theme.band), 7.0);
+}
+
+// The menu bar's style sheet; with `menus`, also the popups' (Live 11, whose
+// popups have no style of their own).
+QString styleFor(int bandHeight, bool menus = true)
 {
     // Live's theme colours. Live's own disabled text is faint in several themes
     // (TextDisabled on SurfaceBackground is about 2:1 in the Light themes), so
@@ -464,11 +502,18 @@ QString styleFor(int bandHeight)
     const QColor band = theme.band;
     const QColor popup = theme.surface;
     const QColor text = withContrast(theme.text, popup, extreme(popup), 7.0);
-    const QColor barText = withContrast(text, band, extreme(band), 7.0);
+    const QColor barText = barTextColour(theme);
     const QColor disabled = withContrast(theme.disabled, popup, text, 3.5);
     const QColor hover = mix(popup, text, 0.16);
     const QColor barHover = mix(band, barText, 0.16);
     const QColor line = mix(popup, text, 0.3);
+    if (!menus)
+        return QString(R"(
+QMenuBar { background: %1; color: %2; border: none; padding: 0 2px; spacing: 0px; }
+QMenuBar::item { background: transparent; padding: %4; }
+QMenuBar::item:selected, QMenuBar::item:pressed { background: %3; }
+)")
+            .arg(band.name(), barText.name(), barHover.name(), itemPadding(bandHeight));
     return QString(R"(
 QMenuBar { background: %1; color: %2; border: none; padding: 0 2px; spacing: 0px; }
 QMenuBar::item { background: transparent; padding: %8; }
@@ -528,16 +573,21 @@ QVector<QWidget *> viewsWithBar()
     return views;
 }
 
+// Live 12: the bar's style sheet, the drop-down menus' look and the title
+// bar colours.
 void restyle(QMenuBar *bar)
 {
     const int band = bar->property("liveBand").toInt();
     if (band <= 0)
         return;
-    const QString style = styleFor(band);
+    const QString style = styleFor(band, false);
     if (bar->property("liveStyle").toString() != style) {
         bar->setProperty("liveStyle", style);
         bar->setStyleSheet(style);
     }
+    const ThemeColours theme = themeColours();
+    menuStyle()->look = chrome::menuLook(themeColour(kMenuBackground), theme.text, theme.disabled, band);
+    applyTitleBarColours(theme.band, barTextColour(theme));
 }
 
 void placeBar(QWidget *view)
@@ -551,10 +601,15 @@ void placeBar(QWidget *view)
         return;
     }
     restyle(bar);
-    // Scale the bar's font with Live's zoom (Live's band is 24 px at 100 %).
+    // Scale the bar's font with Live's zoom (Live's band is 24 px at 100 %),
+    // in Live's menu font when it loads.
     QFont font = bar->font();
+    if (!menuFontFamily().isEmpty())
+        font.setFamily(menuFontFamily());
     font.setPixelSize(barFontSize(band));
     bar->setFont(font);
+    static int barInLive = -1;
+    traceInLiveFont("nativemenu: bar in Live's menu font %d\n", barInLive, bar);
     bar->setGeometry(0, 0, view->width(), band);
     bar->raise();
     bar->show();
@@ -597,14 +652,35 @@ void notify(void *notifier)
 }
 
 QPointer<QWidget> paintingView; // the view whose paint event is being delivered
+QPointer<QWidget> paintedWidget; // the widget whose paint event is being delivered
+
+// At a fractional scale Live's frame image can be a pixel narrower or shorter
+// than the view, and the uncovered strip showed Qt's light grey window
+// background. It gets Live's own edge pixels instead (chrome.h). The display
+// keeps the frame image at + 8. Inside the view's paint event only.
+void fillEdges(void *display)
+{
+    QWidget *view = paintedWidget;
+    paintedWidget = nullptr;
+    if (!view || !display || !view->testAttribute(Qt::WA_WState_InPaintEvent))
+        return;
+    const QImage &image = *reinterpret_cast<const QImage *>(static_cast<char *>(display) + 8);
+    const QSize device = chrome::deviceSize(view);
+    if (image.isNull() || (device.width() <= image.width() && device.height() <= image.height()))
+        return;
+    QPainter painter(view);
+    if (painter.isActive())
+        chrome::fillUncovered(painter, device, image);
+}
 
 } // namespace
 
 void liveWindowPainted(void *viewManager); // window.cpp
 
 // Called after Live has presented a frame of the view being painted.
-void livePainted(void *viewManager, void *)
+void livePainted(void *viewManager, void *display)
 {
+    fillEdges(display);
     liveWindowPainted(viewManager);
     QWidget *view = paintingView;
     paintingView = nullptr;
@@ -667,12 +743,14 @@ void attachBar(QMainWindow *window)
     menufixTrace("nativemenu: bar attached, %d menus\n", bar->actions().size());
 }
 
+bool barsOn; // Live's menu band is replaced by a QMenuBar
+
 class MenuBarAttacher : public QObject
 {
 public:
     bool eventFilter(QObject *o, QEvent *e) override
     {
-        if (e->type() == QEvent::Show && o->isWidgetType()) {
+        if (e->type() == QEvent::Show && o->isWidgetType() && barsOn) {
             auto *w = static_cast<QWidget *>(o);
             if (w->isWindow() && w->windowType() == Qt::Window)
                 if (auto *main = qobject_cast<QMainWindow *>(w))
@@ -683,6 +761,7 @@ public:
                 bar->setGeometry(0, 0, view->width(), bar->height());
             }
         } else if (e->type() == QEvent::Paint && o->isWidgetType()) {
+            paintedWidget = static_cast<QWidget *>(o);
             if (barOf(static_cast<QWidget *>(o)))
                 paintingView = static_cast<QWidget *>(o);
         }
@@ -901,9 +980,12 @@ void installNativeMenu()
                                       reinterpret_cast<void *>(&paintHandler));
     menufixTrace("nativemenu: theme colours %d, theme hook %d, paint hook %d\n", liveColours, themeHooked, paintHooked);
     const bool menuBarView = field<uintptr_t>(base, kMenuBarViewVtable) == base + kMenuBarViewDestructor;
-    if (!paintHooked || !liveColours || !menuBarView)
+    if (!paintHooked)
+        return;
+    barsOn = liveColours && menuBarView;
+    qApp->installEventFilter(new MenuBarAttacher); // also tracks painted widgets for the edge fill
+    if (!barsOn)
         return; // another Live build: Live's own menu band stays
-    qApp->installEventFilter(new MenuBarAttacher);
     // Live adds or renames top-level menus at runtime (e.g. after loading a
     // language); check the menu tree regularly (cheap). Without the theme
     // hook, theme changes are found the same way.
