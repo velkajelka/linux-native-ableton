@@ -725,6 +725,9 @@ cp "$MODS/shim/libmenufix.so" "$PREFIX/shim/"
 # The launcher preloads it when the install path has a hidden folder (the default
 # ~/.local/share/...): otherwise Live does not index its built-in devices.
 cp "$MODS/shim/libpathfix.so" "$PREFIX/shim/"
+# Edit in Max (on by default, LIVE_MAX_EDIT=0 turns it off): Live's Linux Max editor through a launcher that preloads
+# the editor's Linux fixes (shim/maxstatfix.c: btrfs, liveowner, shared memory, zenity).
+cp "$MODS/shim/libmaxstatfix.so" "$MODS/shim/max-editor" "$PREFIX/shim/"
 # The Push 3 companion (Push3), which Live starts when Push hardware is connected, links
 # the Push OS update library; the image has it only in the device's system partition and
 # it waits forever for the device's update service. A stand-in that reports "no update
