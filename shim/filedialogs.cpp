@@ -24,11 +24,16 @@
 // puts QFileDialog versions into that table through the same setters, once
 // Live has registered its own, as Windows Live puts its IFileDialog versions
 // there; Live's code is not changed. With
-// QT_QPA_PLATFORMTHEME=xdgdesktopportal (set by run-live-desktop.sh) Qt shows
-// the desktop's own dialog through xdg-desktop-portal: KDE's on Plasma, GTK's
-// on GNOME. Where no portal offers a FileChooser (a bare window manager), that
-// theme would reject every dialog at once, so Qt's own dialog is used instead.
-// LIVE_NATIVE_DIALOGS=0 keeps Live's dialogs.
+// QT_QPA_PLATFORMTHEME=xdgdesktopportal (standalone.cpp's default) the desktop's
+// own dialog is shown through xdg-desktop-portal's FileChooser: KDE's on Plasma,
+// GTK's on GNOME. The shim makes that request itself (GDBus; portalRequest)
+// rather than through Qt 5.15's portal dialog, which takes a failed request
+// (response 2, or an error reply) for a cancelled one: on niri, whose default
+// portal configuration names GNOME's portal first, GNOME's file chooser fails
+// unless Nautilus is installed, and every open, save and folder dialog did
+// nothing. After a failed request, and where no portal offers a FileChooser at
+// all (a bare window manager), Qt's own dialog is used. LIVE_NATIVE_DIALOGS=0
+// keeps Live's dialogs.
 //
 // Live keeps running while its own dialog is open. Its modal loop (Live 12
 // 0x1ff39b0, Live 11 0x1b9a370) starts two timers next to its QEventLoop:
@@ -45,19 +50,29 @@
 // file type table (registered in 0x1be15e0). Addresses are for Live 12.4.7.
 #include "livebuild.h"
 #include <QApplication>
+#include <QGuiApplication>
 #include <QTimer>
 #include <QDBusConnection>
 #include <QDBusMessage>
 #include <QDir>
 #include <QFileDialog>
+#include <QFile>
 #include <QFileInfo>
 #include <QStringList>
+#include <QDialog>
+#include <QUrl>
 #include <QWidget>
 #include <cstdint>
 #include <cstring>
 #include <cxxabi.h>
 #include <iterator>
 #include <link.h>
+#include <string>
+#include <unistd.h>
+#pragma push_macro("signals")
+#undef signals // a member name in GLib's headers, a keyword for Qt
+#include <gio/gio.h>
+#pragma pop_macro("signals")
 #include <new>
 #include <string>
 
@@ -401,13 +416,28 @@ QWidget *dialogParent()
     return nullptr;
 }
 
-// Qt's own dialog when the portal theme is in use but no portal FileChooser
-// answers; checked once, at the first dialog.
+bool portalTheme()
+{
+    static const bool portal = qEnvironmentVariable("QT_QPA_PLATFORMTHEME") == QLatin1String("xdgdesktopportal");
+    return portal;
+}
+
+// With the portal theme, Qt's QFileDialog would go through the portal again:
+// it is only used as Qt's own dialog then.
 QFileDialog::Options dialogOptions()
 {
-    static const bool portal = [] {
-        if (qEnvironmentVariable("QT_QPA_PLATFORMTHEME") != QLatin1String("xdgdesktopportal"))
-            return true;
+    return portalTheme() ? QFileDialog::DontUseNativeDialog : QFileDialog::Options();
+}
+
+bool portalFailed; // a request failed: Qt's own dialog for the rest of the session
+
+// Whether to ask the portal: the theme is in use, a portal offers a FileChooser
+// (checked once, at the first dialog) and no request has failed.
+bool usePortal()
+{
+    static const bool offered = [] {
+        if (!portalTheme())
+            return false;
         QDBusMessage get = QDBusMessage::createMethodCall(
             QStringLiteral("org.freedesktop.portal.Desktop"), QStringLiteral("/org/freedesktop/portal/desktop"),
             QStringLiteral("org.freedesktop.DBus.Properties"), QStringLiteral("Get"));
@@ -416,7 +446,191 @@ QFileDialog::Options dialogOptions()
         menufixTrace("filedialogs: portal FileChooser %d\n", ok);
         return ok;
     }();
-    return portal ? QFileDialog::Options() : QFileDialog::DontUseNativeDialog;
+    return offered && !portalFailed;
+}
+
+// "Name (*.a *.b)" -> ("Name", [(0, "*.a"), (0, "*.b")]), the portal's filter.
+GVariant *portalFilter(const QString &filter)
+{
+    const int open = filter.lastIndexOf('('), close = filter.lastIndexOf(')');
+    const QString name = open > 0 ? filter.left(open).trimmed() : filter;
+    GVariantBuilder patterns;
+    g_variant_builder_init(&patterns, G_VARIANT_TYPE("a(us)"));
+    if (open >= 0 && close > open)
+        for (const QString &p : filter.mid(open + 1, close - open - 1).split(' ', Qt::SkipEmptyParts))
+            g_variant_builder_add(&patterns, "(us)", 0u, p.toUtf8().constData());
+    return g_variant_new("(s@a(us))", name.toUtf8().constData(), g_variant_builder_end(&patterns));
+}
+
+void addFilters(GVariantBuilder *options, const QStringList &filters, const QString &current)
+{
+    if (filters.isEmpty())
+        return;
+    GVariantBuilder list;
+    g_variant_builder_init(&list, G_VARIANT_TYPE("a(sa(us))"));
+    for (const QString &f : filters)
+        g_variant_builder_add_value(&list, portalFilter(f));
+    g_variant_builder_add(options, "{sv}", "filters", g_variant_builder_end(&list));
+    if (!current.isEmpty())
+        g_variant_builder_add(options, "{sv}", "current_filter", portalFilter(current));
+}
+
+struct PortalAnswer {
+    enum Status { Ok, Cancelled, Failed } status = Failed;
+    QStringList paths;
+    QString filter; // the name of the filter the dialog ended with
+};
+
+struct PortalRequest {
+    GDBusConnection *bus = nullptr;
+    std::string handle;
+    guint subscription = 0;
+    bool called = false, answered = false;
+    guint32 response = 2;
+    GVariant *results = nullptr;
+};
+
+void portalResponse(GDBusConnection *, const gchar *, const gchar *, const gchar *, const gchar *, GVariant *parameters,
+                    gpointer data)
+{
+    auto *r = static_cast<PortalRequest *>(data);
+    if (r->answered || !g_variant_is_of_type(parameters, G_VARIANT_TYPE("(ua{sv})")))
+        return;
+    g_variant_get(parameters, "(u@a{sv})", &r->response, &r->results);
+    r->answered = true;
+}
+
+void subscribe(PortalRequest *r)
+{
+    r->subscription = g_dbus_connection_signal_subscribe(r->bus, nullptr, "org.freedesktop.portal.Request", "Response",
+                                                         r->handle.c_str(), nullptr, G_DBUS_SIGNAL_FLAGS_NONE,
+                                                         portalResponse, r, nullptr);
+}
+
+void portalCalled(GObject *source, GAsyncResult *result, gpointer data)
+{
+    auto *r = static_cast<PortalRequest *>(data);
+    GError *error = nullptr;
+    GVariant *reply = g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), result, &error);
+    r->called = true;
+    if (!reply) {
+        menufixTrace("filedialogs: portal call failed: %d\n", error ? error->code : -1);
+        g_clear_error(&error);
+        r->answered = true; // response stays 2
+        return;
+    }
+    const gchar *handle = nullptr;
+    g_variant_get(reply, "(&o)", &handle);
+    if (handle && r->handle != handle) { // portals before 0.9 choose the path themselves
+        g_dbus_connection_signal_unsubscribe(r->bus, r->subscription);
+        r->handle = handle;
+        subscribe(r);
+    }
+    g_variant_unref(reply);
+}
+
+// One FileChooser request (OpenFile or SaveFile) with `options` (consumed),
+// modal like Qt's own portal dialog: an application-modal QDialog that is
+// never on screen blocks Live's windows until the portal answers. The reply and
+// the Response signal arrive in a main context of their own, which a 10 ms
+// timer runs, so this works with any Qt event dispatcher.
+PortalAnswer portalRequest(const char *method, const QString &title, GVariantBuilder *options)
+{
+    PortalAnswer answer;
+    GError *error = nullptr;
+    PortalRequest r;
+    r.bus = g_bus_get_sync(G_BUS_TYPE_SESSION, nullptr, &error);
+    if (!r.bus) {
+        g_clear_error(&error);
+        g_variant_builder_clear(options);
+        return answer;
+    }
+    static int requests;
+    const std::string token = "ableton_live_" + std::to_string(getpid()) + "_" + std::to_string(++requests);
+    std::string sender = g_dbus_connection_get_unique_name(r.bus) + 1; // ":1.42" -> "1_42"
+    for (char &c : sender)
+        if (c == '.')
+            c = '_';
+    r.handle = "/org/freedesktop/portal/desktop/request/" + sender + "/" + token;
+    g_variant_builder_add(options, "{sv}", "handle_token", g_variant_new_string(token.c_str()));
+    g_variant_builder_add(options, "{sv}", "modal", g_variant_new_boolean(TRUE));
+
+    QWidget *parent = dialogParent();
+    const QByteArray window = parent ? "x11:" + QByteArray::number(qulonglong(parent->winId()), 16) : QByteArray();
+    GMainContext *context = g_main_context_new();
+    g_main_context_push_thread_default(context);
+    subscribe(&r);
+    g_dbus_connection_call(r.bus, "org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
+                           "org.freedesktop.portal.FileChooser", method,
+                           g_variant_new("(ss@a{sv})", window.constData(), title.toUtf8().constData(),
+                                         g_variant_builder_end(options)),
+                           G_VARIANT_TYPE("(o)"), G_DBUS_CALL_FLAGS_NONE, G_MAXINT, nullptr, portalCalled, &r);
+    g_main_context_pop_thread_default(context);
+
+    QDialog blocker(parent);
+    blocker.setAttribute(Qt::WA_DontShowOnScreen);
+    blocker.setWindowModality(Qt::ApplicationModal);
+    // A shown dialog takes the focus from Live (see the end).
+    const bool wasActive = QGuiApplication::applicationState() == Qt::ApplicationActive;
+    bool lostFocus = false;
+    QTimer poll;
+    QObject::connect(&poll, &QTimer::timeout, [&] {
+        lostFocus |= QGuiApplication::applicationState() != Qt::ApplicationActive;
+        while (g_main_context_iteration(context, FALSE)) {
+        }
+        if (r.called && r.answered)
+            blocker.accept();
+    });
+    poll.start(10);
+    blocker.exec();
+    poll.stop();
+
+    g_dbus_connection_signal_unsubscribe(r.bus, r.subscription);
+    while (g_main_context_iteration(context, FALSE)) {
+    }
+    g_main_context_unref(context);
+    g_object_unref(r.bus);
+
+    // Response 2 ("ended some other way") is both a backend that failed (GNOME's
+    // without Nautilus: no dialog at all) and a dialog closed with Escape or its
+    // window's close button (GTK's). Only a dialog that was shown took the focus.
+    if (r.response == 1 || (r.response == 2 && r.called && wasActive && lostFocus)) {
+        answer.status = PortalAnswer::Cancelled;
+    } else if (r.response == 0 && r.results) {
+        if (GVariant *uris = g_variant_lookup_value(r.results, "uris", G_VARIANT_TYPE_STRING_ARRAY)) {
+            GVariantIter it;
+            const gchar *uri;
+            g_variant_iter_init(&it, uris);
+            while (g_variant_iter_next(&it, "&s", &uri)) {
+                const QString path = QUrl(QString::fromUtf8(uri)).toLocalFile();
+                if (!path.isEmpty())
+                    answer.paths << path;
+            }
+            g_variant_unref(uris);
+        }
+        if (GVariant *filter = g_variant_lookup_value(r.results, "current_filter", G_VARIANT_TYPE("(sa(us))"))) {
+            const gchar *name = nullptr;
+            g_variant_get(filter, "(&s@a(us))", &name, nullptr);
+            answer.filter = QString::fromUtf8(name);
+            g_variant_unref(filter);
+        }
+        // An answer without a local file (a remote location): as cancelled.
+        answer.status = answer.paths.isEmpty() ? PortalAnswer::Cancelled : PortalAnswer::Ok;
+    }
+    if (r.results)
+        g_variant_unref(r.results);
+    menufixTrace("filedialogs: portal %c -> response %d, %d files\n", method[0], int(r.response), int(answer.paths.size()));
+    menufixTrace("filedialogs: portal focus: active at start %d, lost %d\n", wasActive, lostFocus);
+    if (answer.status == PortalAnswer::Failed) {
+        portalFailed = true;
+        menufixTrace("filedialogs: the portal's file chooser failed: Qt's own dialog from now on\n");
+    }
+    return answer;
+}
+
+GVariant *folderBytes(const QString &folder)
+{
+    return g_variant_new_bytestring(QFile::encodeName(folder).constData());
 }
 
 QString startDir(const std::string *dir)
@@ -436,10 +650,20 @@ void throwSilent()
 void openFile(const void *title, const std::string *dir, int kind, void *receiver)
 {
     const auto mask = reinterpret_cast<TypeMask (*)(int)>(base + kKindMask)(kind);
+    const QStringList filters = filtersFor(mask);
     const QString file = [&] {
         LiveTicks ticks;
+        if (usePortal()) {
+            GVariantBuilder options;
+            g_variant_builder_init(&options, G_VARIANT_TYPE("a{sv}"));
+            addFilters(&options, filters, filters.value(0));
+            g_variant_builder_add(&options, "{sv}", "current_folder", folderBytes(startDir(dir)));
+            const PortalAnswer a = portalRequest("OpenFile", fromTText(title), &options);
+            if (a.status != PortalAnswer::Failed)
+                return a.paths.value(0);
+        }
         return QFileDialog::getOpenFileName(dialogParent(), fromTText(title), startDir(dir),
-                                            filtersFor(mask).join(QStringLiteral(";;")), nullptr, dialogOptions());
+                                            filters.join(QStringLiteral(";;")), nullptr, dialogOptions());
     }();
     menufixTrace("filedialogs: open kind %d -> %d\n", kind, !file.isEmpty());
     if (file.isEmpty())
@@ -458,6 +682,21 @@ int saveFile(const void *title, const void *name, const std::string *dir, uint64
     const QString initial = QDir(startDir(dir)).filePath(fromTText(name));
     QString file = [&] {
         LiveTicks ticks;
+        if (usePortal()) {
+            GVariantBuilder options;
+            g_variant_builder_init(&options, G_VARIANT_TYPE("a{sv}"));
+            addFilters(&options, filters, selected);
+            g_variant_builder_add(&options, "{sv}", "current_folder", folderBytes(startDir(dir)));
+            g_variant_builder_add(&options, "{sv}", "current_name",
+                                  g_variant_new_string(fromTText(name).toUtf8().constData()));
+            const PortalAnswer a = portalRequest("SaveFile", fromTText(title), &options);
+            if (a.status != PortalAnswer::Failed) {
+                for (const QString &f : filters)
+                    if (!a.filter.isEmpty() && f.startsWith(a.filter + QLatin1String(" (")))
+                        selected = f;
+                return a.paths.value(0);
+            }
+        }
         return QFileDialog::getSaveFileName(dialogParent(), fromTText(title), initial,
                                             filters.join(QStringLiteral(";;")), &selected, dialogOptions());
     }();
@@ -486,6 +725,15 @@ std::string *chooseFolder(std::string *result, const void *title, const std::str
 {
     const QString folder = [&] {
         LiveTicks ticks;
+        if (usePortal()) {
+            GVariantBuilder options;
+            g_variant_builder_init(&options, G_VARIANT_TYPE("a{sv}"));
+            g_variant_builder_add(&options, "{sv}", "directory", g_variant_new_boolean(TRUE));
+            g_variant_builder_add(&options, "{sv}", "current_folder", folderBytes(startDir(dir)));
+            const PortalAnswer a = portalRequest("OpenFile", fromTText(title), &options);
+            if (a.status != PortalAnswer::Failed)
+                return a.paths.value(0);
+        }
         return QFileDialog::getExistingDirectory(dialogParent(), fromTText(title), startDir(dir),
                                                  QFileDialog::ShowDirsOnly | dialogOptions());
     }();

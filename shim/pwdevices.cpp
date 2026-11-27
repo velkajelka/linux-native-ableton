@@ -578,17 +578,25 @@ extern "C" const char *snd_pcm_info_get_name(const snd_pcm_info_t *info)
     return filledCard(info) >= 0 ? "" : real(info);
 }
 
+void rootStatFix(const char *path, struct stat *st); // licensing.cpp
+
 // Live's references are versioned GLIBC_2.33 (shim/qt5.map).
 extern "C" int stat(const char *path, struct stat *buf)
 {
     using Fn = int (*)(const char *, struct stat *);
     static auto real = reinterpret_cast<Fn>(nextSymbol("stat", "GLIBC_2.33"));
-    return statDevSnd(real, path, buf);
+    const int result = statDevSnd(real, path, buf);
+    if (result == 0)
+        rootStatFix(path, buf);
+    return result;
 }
 
 extern "C" int stat64(const char *path, struct stat64 *buf)
 {
     using Fn = int (*)(const char *, struct stat64 *);
     static auto real = reinterpret_cast<Fn>(nextSymbol("stat64", "GLIBC_2.33"));
-    return statDevSnd(real, path, buf);
+    const int result = statDevSnd(real, path, buf);
+    if (result == 0)
+        rootStatFix(path, reinterpret_cast<struct stat *>(buf)); // the same layout on x86-64
+    return result;
 }

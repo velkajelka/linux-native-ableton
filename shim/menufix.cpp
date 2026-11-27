@@ -12,6 +12,8 @@
 #include <QTimer>
 #include <QRect>
 #include <QWidget>
+#include <QWindow>
+#include <QGuiApplication>
 #include <dlfcn.h>
 #include <climits>
 #include <cstdio>
@@ -21,20 +23,21 @@
 // Keep the preload out of Live's child processes (sh, lspci, helpers), except
 // the AVX-512 emulator (libavx512emu.so): on CPUs without AVX-512 the launcher
 // preloads it, and Live's helpers (Ableton Index, Plugin Scanner, XPython3Exe)
-// need it as much as Live does.
+// need it as much as Live does. libpathfix.so and libpackmeta.so stay too: the
+// indexer needs them (it reads the packs' Metadata.cfg, packmeta.cpp).
 __attribute__((constructor)) static void dropPreload()
 {
-    // Child processes keep the AVX-512 emulator and libpathfix.so (tools/launcher.c),
-    // in that order; the shim itself and anything else are dropped.
+    // Child processes keep the AVX-512 emulator, libpathfix.so and libpackmeta.so
+    // (tools/launcher.c), in that order; the shim itself and anything else are dropped.
     const char *old = getenv("LD_PRELOAD");
-    char keep[2][PATH_MAX] = {"", ""};
-    static const char *const kept[2] = {"libavx512emu.so", "libpathfix.so"};
+    char keep[3][PATH_MAX] = {"", "", ""};
+    static const char *const kept[3] = {"libavx512emu.so", "libpathfix.so", "libpackmeta.so"};
     if (old) {
         const char *p = old;
         while (*p) {
             const char *end = p + strcspn(p, ": ");
             const size_t n = static_cast<size_t>(end - p);
-            for (int k = 0; k < 2; ++k)
+            for (int k = 0; k < 3; ++k)
                 if (n && n < sizeof keep[k] && memmem(p, n, kept[k], strlen(kept[k])) && !keep[k][0]) {
                     memcpy(keep[k], p, n);
                     keep[k][n] = '\0';
@@ -42,8 +45,13 @@ __attribute__((constructor)) static void dropPreload()
             p = *end ? end + 1 : end;
         }
     }
-    char value[2 * PATH_MAX + 2];
-    snprintf(value, sizeof value, "%s%s%s", keep[0], keep[0][0] && keep[1][0] ? ":" : "", keep[1]);
+    char value[3 * PATH_MAX + 3] = "";
+    for (int k = 0; k < 3; ++k)
+        if (keep[k][0]) {
+            if (value[0])
+                strcat(value, ":");
+            strcat(value, keep[k]);
+        }
     if (value[0])
         setenv("LD_PRELOAD", value, 1);
     else
@@ -69,6 +77,10 @@ void installFrameBufferHook();
 void installNativeMenu();
 void installWindowIntegration();
 void installFileDialogs();
+void installHideMaxExports(); // hideexports.cpp
+void installDesktopEnv();     // desktopenv.cpp
+void installModalRefresh();   // modalrefresh.cpp
+void installShowInFolder();
 void installDragCursor();
 void installSleepInhibit();
 void installPointerWarp();
@@ -98,6 +110,35 @@ void closeMenus()
     for (const auto &w : menus)
         if (w && isMenuWindow(w))
             w->close();
+}
+
+
+// Qt blocks the mouse for every window that is not linked to an open
+// application-modal window (Export Audio/Video). A list's frame is exempt as a
+// tool tip, but the child window the pointer lands on is not, and nothing links
+// the list to the dialog, so its hovers and clicks were dropped. Link the list
+// to the modal window and have Qt re-evaluate it and its child windows.
+void linkToModal(QWidget *w)
+{
+    QWindow *modal = QGuiApplication::modalWindow();
+    QWindow *list = w->windowHandle();
+    if (!modal || !list || modal->isAncestorOf(list, QWindow::IncludeTransients))
+        return;
+    using UpdateBlocked = void (*)(QWindow *);
+    static const auto updateBlocked = reinterpret_cast<UpdateBlocked>(dlvsym(RTLD_DEFAULT,
+        "_ZN22QGuiApplicationPrivate19updateBlockedStatusEP7QWindow", "Qt_5_PRIVATE_API"));
+    if (!updateBlocked) { // without the refresh the link alone does not help: change nothing
+        static bool warned = false;
+        if (!warned)
+            trace("modal-list: no blocked-status refresh in this Qt\n");
+        warned = true;
+        return;
+    }
+    list->setTransientParent(modal);
+    updateBlocked(list);
+    for (QWindow *child : list->findChildren<QWindow *>())
+        updateBlocked(child);
+    trace("modal-list win=%x\n", int(quintptr(w) & 0xffffff));
 }
 
 class MenuCloser : public QObject {
@@ -152,6 +193,7 @@ public:
             trace("show %d,%d fromMenu=%d", pos.x(), pos.y(), fromMenu);
             trace(" win=%x geo=%dx%d", int(quintptr(w) & 0xffffff), w->width(), w->height());
             trace("+%d+%d\n", w->x(), w->y());
+            linkToModal(w);
             if (!fromMenu && w->geometry() == toggled && toggleClock.isValid()
                 && toggleClock.elapsed() < 300) {
                 trace("toggle-close x=%d\n", w->x());
@@ -245,6 +287,10 @@ static void installMenuCloser()
     installNativeMenu();
     installWindowIntegration();
     installFileDialogs();
+    installHideMaxExports();
+    installDesktopEnv();
+    installModalRefresh();
+    installShowInFolder();
     installDragCursor();
     installSleepInhibit();
     installPointerWarp();

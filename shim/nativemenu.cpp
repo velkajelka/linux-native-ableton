@@ -18,12 +18,14 @@
 // LIVE_NATIVE_MENU=0 turns it off.
 //
 // Addresses are file-relative virtual addresses in AbletonLive12 (PIE).
+#include "chrome.h"
 #include "livebuild.h"
 #include <QApplication>
 #include <QFontMetrics>
 #include <QMainWindow>
 #include <QMenu>
 #include <QMenuBar>
+#include <QPainter>
 #include <QPointer>
 #include <QLayout>
 #include <QResizeEvent>
@@ -597,14 +599,35 @@ void notify(void *notifier)
 }
 
 QPointer<QWidget> paintingView; // the view whose paint event is being delivered
+QPointer<QWidget> paintedWidget; // the widget whose paint event is being delivered
+
+// At a fractional scale Live's frame image can be a pixel narrower or shorter
+// than the view, and the uncovered strip showed Qt's light grey window
+// background. It gets Live's own edge pixels instead (chrome.h). The display
+// keeps the frame image at + 8. Inside the view's paint event only.
+void fillEdges(void *display)
+{
+    QWidget *view = paintedWidget;
+    paintedWidget = nullptr;
+    if (!view || !display || !view->testAttribute(Qt::WA_WState_InPaintEvent))
+        return;
+    const QImage &image = *reinterpret_cast<const QImage *>(static_cast<char *>(display) + 8);
+    const QSize device = chrome::deviceSize(view);
+    if (image.isNull() || (device.width() <= image.width() && device.height() <= image.height()))
+        return;
+    QPainter painter(view);
+    if (painter.isActive())
+        chrome::fillUncovered(painter, device, image);
+}
 
 } // namespace
 
 void liveWindowPainted(void *viewManager); // window.cpp
 
 // Called after Live has presented a frame of the view being painted.
-void livePainted(void *viewManager, void *)
+void livePainted(void *viewManager, void *display)
 {
+    fillEdges(display);
     liveWindowPainted(viewManager);
     QWidget *view = paintingView;
     paintingView = nullptr;
@@ -667,12 +690,14 @@ void attachBar(QMainWindow *window)
     menufixTrace("nativemenu: bar attached, %d menus\n", bar->actions().size());
 }
 
+bool barsOn; // Live's menu band is replaced by a QMenuBar
+
 class MenuBarAttacher : public QObject
 {
 public:
     bool eventFilter(QObject *o, QEvent *e) override
     {
-        if (e->type() == QEvent::Show && o->isWidgetType()) {
+        if (e->type() == QEvent::Show && o->isWidgetType() && barsOn) {
             auto *w = static_cast<QWidget *>(o);
             if (w->isWindow() && w->windowType() == Qt::Window)
                 if (auto *main = qobject_cast<QMainWindow *>(w))
@@ -683,6 +708,7 @@ public:
                 bar->setGeometry(0, 0, view->width(), bar->height());
             }
         } else if (e->type() == QEvent::Paint && o->isWidgetType()) {
+            paintedWidget = static_cast<QWidget *>(o);
             if (barOf(static_cast<QWidget *>(o)))
                 paintingView = static_cast<QWidget *>(o);
         }
@@ -901,9 +927,12 @@ void installNativeMenu()
                                       reinterpret_cast<void *>(&paintHandler));
     menufixTrace("nativemenu: theme colours %d, theme hook %d, paint hook %d\n", liveColours, themeHooked, paintHooked);
     const bool menuBarView = field<uintptr_t>(base, kMenuBarViewVtable) == base + kMenuBarViewDestructor;
-    if (!paintHooked || !liveColours || !menuBarView)
+    if (!paintHooked)
+        return;
+    barsOn = liveColours && menuBarView;
+    qApp->installEventFilter(new MenuBarAttacher); // also tracks painted widgets for the edge fill
+    if (!barsOn)
         return; // another Live build: Live's own menu band stays
-    qApp->installEventFilter(new MenuBarAttacher);
     // Live adds or renames top-level menus at runtime (e.g. after loading a
     // language); check the menu tree regularly (cheap). Without the theme
     // hook, theme changes are found the same way.

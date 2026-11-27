@@ -23,8 +23,9 @@
 //     XDG_DATA_HOME and XDG_CACHE_HOME point into the data folder too;
 //   - LD_LIBRARY_PATH for Live's helper programs (Ableton Index, Plugin
 //     Scanner, Web Connector), which have no RPATH of their own;
-//   - the KWin rule for plug-in editors (tools/kwin-plugin-rule.sh), run in
-//     the background with the real HOME;
+//   - tools/kwin-plugin-rule.sh, which removes the KWin rule for plug-in
+//     editors that earlier versions added, run in the background with the
+//     real HOME;
 //   - the working directory: push3_opt/push3, as the launcher had it.
 // Variables that are already set (by the launcher, or by the user) are kept,
 // except the Qt paths, which must point at the bundled Qt.
@@ -426,11 +427,17 @@ template <typename Fn> Fn real(const char *name, const char *version)
 
 } // namespace
 
+char *const *desktopEnvFor(const char *path, char *const argv[]); // desktopenv.cpp
+bool commandIsOpener(const char *command);                          // desktopenv.cpp
+
 extern "C" int execv(const char *path, char *const argv[])
 {
     static auto next = real<int (*)(const char *, char *const[])>("execv", "GLIBC_2.2.5");
+    static auto nextEnv = real<int (*)(const char *, char *const[], char *const[])>("execve", "GLIBC_2.2.5");
     if (runsRegistration(path, argv))
         _exit(0); // in Live's child process, before the exec
+    if (char *const *env = desktopEnvFor(path, argv))
+        return nextEnv(path, argv, env); // xdg-open and the like: the desktop's environment
     char *buf[kCompanionArgs];
     char *const *args = companionArgs(path, argv, buf);
     return next(path, args ? args : argv);
@@ -441,6 +448,8 @@ extern "C" int execve(const char *path, char *const argv[], char *const envp[])
     static auto next = real<int (*)(const char *, char *const[], char *const[])>("execve", "GLIBC_2.2.5");
     if (runsRegistration(path, argv))
         _exit(0);
+    if (char *const *env = desktopEnvFor(path, argv))
+        return next(path, argv, env);
     char *buf[kCompanionArgs];
     char *const *args = companionArgs(path, argv, buf);
     return next(path, args ? args : argv, envp);
@@ -455,6 +464,8 @@ extern "C" int posix_spawn(pid_t *pid, const char *path, const posix_spawn_file_
     static char *const trueArgv[] = {const_cast<char *>("true"), nullptr};
     if (runsRegistration(path, argv))
         return next(pid, "/bin/true", actions, attr, trueArgv, envp);
+    if (char *const *env = desktopEnvFor(path, argv))
+        return next(pid, path, actions, attr, argv, env);
     char *buf[kCompanionArgs];
     size_t dropped = 0;
     char *const *args = companionArgs(path, argv, buf, &dropped);
@@ -471,6 +482,8 @@ extern "C" int posix_spawnp(pid_t *pid, const char *file, const posix_spawn_file
     static char *const trueArgv[] = {const_cast<char *>("true"), nullptr};
     if (runsRegistration(file, argv))
         return next(pid, "true", actions, attr, trueArgv, envp);
+    if (char *const *env = desktopEnvFor(file, argv))
+        return next(pid, file, actions, attr, argv, env);
     char *buf[kCompanionArgs];
     size_t dropped = 0;
     char *const *args = companionArgs(file, argv, buf, &dropped);
@@ -486,6 +499,22 @@ extern "C" int system(const char *command)
         const char *start = command + strspn(command, " \t");
         if (isRegistration(start))
             return 0;
+        if (commandIsOpener(start)) {
+            // As system() does, through sh -c, with the desktop's environment.
+            char *const argv[] = {const_cast<char *>("sh"), const_cast<char *>("-c"), const_cast<char *>(command), nullptr};
+            if (char *const *env = desktopEnvFor("/bin/sh", argv)) {
+                static auto spawn = real<int (*)(pid_t *, const char *, const posix_spawn_file_actions_t *,
+                                                 const posix_spawnattr_t *, char *const[], char *const[])>(
+                    "posix_spawn", "GLIBC_2.15");
+                pid_t pid;
+                if (spawn(&pid, "/bin/sh", nullptr, nullptr, argv, env) != 0)
+                    return -1;
+                int status = 0;
+                while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+                }
+                return status;
+            }
+        }
     }
     return next(command);
 }

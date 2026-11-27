@@ -28,3 +28,36 @@ AUR package's boost1.89.0.patch:
   make
 (innoextract-compat.cpp: arc4random, GLIBC_2.36 in Arch's static Boost.Random;
 glibccompat.cpp: the C23 strtoul and sscanf of glibc 2.38 headers.)
+
+openssl3/libssl.so.3, openssl3/libcrypto.so.3: OpenSSL 3.0.22 from Debian 12
+(package libssl3 3.0.22-1~deb12u2 from security.debian.org over HTTPS, matching
+the SHA256 in bookworm-security's Packages index:
+cb4784740daa9b3b0eaea2b444bbefa686794afbbf3d678d238c1fd9875f2efd; Apache
+License 2.0, openssl3/LICENSE.openssl). Live 12 needs these two names to start
+but calls nothing in them; install.sh copies them to compat_lib/openssl3 and the
+launcher adds that folder only when the system has no OpenSSL 3 (Fedora 45 ships
+OpenSSL 4 only), so a plug-in that uses OpenSSL 3 gets a maintained build. They
+need glibc 2.34. Debian's build looks for its configuration and CA certificates
+under /usr/lib/ssl (Debian's layout); libcurl and most plug-ins name their own.
+Update with Debian's next security release.
+
+libxml2/libxml2.so.2: libxml2 2.9.13 from Ubuntu 22.04 (package libxml2
+2.9.13+dfsg-1ubuntu0.14 from security.ubuntu.com over HTTPS, matching the SHA256
+in jammy-security's Packages index, whose own SHA256 matches InRelease:
+16e395b2c52d6ab232053468febc69f0876956ec2fae357a941a2a8dab36574f; MIT licence,
+libxml2/LICENSE.libxml2). Max's maxxslt extension needs libxml2.so.2; Arch and
+other current distributions have libxml2.so.16 only, and the Max window showed
+"libxml2.so.2: cannot open shared object file". It needs ICU 70 (compat_lib has
+it for Live 12), zlib, liblzma and glibc 2.34; install.sh copies it to
+compat_lib/libxml2, which the launcher uses only when the system has no
+libxml2.so.2.
+
+libxml2-icu66/libxml2.so.2: libxml2 2.9.10 from Ubuntu 20.04, for Live 11 (package
+libxml2 2.9.10+dfsg-5ubuntu0.20.04.10 from security.ubuntu.com over HTTPS, SHA256
+90145086978f8eb6253621eea93dd1fb144ff6475a17507e467557d63d427e7f, matching
+focal-security's Packages index, whose own SHA256 matches InRelease; MIT licence,
+libxml2-icu66/LICENSE.libxml2). Same purpose as libxml2/ above, but built against ICU 66,
+which Live 11's compat_lib has (Live 11's image has no ICU 70). Ubuntu 20.04's standard
+support ended in 2025: this is its last public build. Only Max's maxxslt loads it, and
+only where the system has no libxml2.so.2. install.sh copies it to compat_lib/libxml2 for
+Live 11.

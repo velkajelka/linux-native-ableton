@@ -1,0 +1,11 @@
+/* libpackmeta.so (packmeta.cpp, packmeta-preload.cpp): its interposers carry glibc's versions,
+   so Live's and the indexer's versioned references bind to them; nothing else is exported. */
+GLIBC_2.2.5 {
+    global: open; open64; fopen; fopen64;
+};
+GLIBC_2.4 {
+    global: openat64;
+};
+LOCAL_ONLY {
+    local: *;
+};

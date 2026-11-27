@@ -8,6 +8,9 @@
 //     push3_opt/push3, so a folder name with spaces cannot split it;
 //     LIVE_SHIM=<path> runs another build). The shim makes the byte patches
 //     in memory and sets up the rest of the environment (shim/standalone.cpp);
+//   - preloads shim/libpackmeta.so after it, by full path, as Live's helpers
+//     keep it: Live's file indexer reads the packs' Metadata.cfg, where packs
+//     installed on Windows have backslash separators (shim/packmeta.cpp);
 //   - on CPUs without the AVX-512 subset Live is compiled for (it targets the
 //     Push 3's Tiger Lake), also preloads the AVX-512 emulator
 //     (../../shim/libavx512emu.so), which translates those instructions to
@@ -15,6 +18,11 @@
 //   - adds push3_opt/push3/lib and compat_lib to LD_LIBRARY_PATH: Live's own
 //     RPATH covers lib/ only, and the loader needs FFmpeg 5 and ICU 70 (Live
 //     11: FFmpeg 58, ICU 66, OpenSSL 1.1) from compat_lib before the shim runs;
+//     Live 12 also needs libssl.so.3 and libcrypto.so.3 to exist (it calls
+//     nothing in them), so compat_lib/openssl3 (Debian 12's maintained OpenSSL 3,
+//     tools/bundled/README) comes last, and only when the system has no OpenSSL 3
+//     (Fedora 45: 4 only); compat_lib/libxml2 the same for libxml2.so.2, which
+//     Max's maxxslt needs (Arch has libxml2.so.16 only);
 //   - runs Live from push3_opt/push3 with the same arguments, argv[0]
 //     included (Live and Qt see the name AbletonLive12 / AbletonLive11);
 //   - when the install folder's path has a hidden folder in it (the default
@@ -22,7 +30,10 @@
 //     ($XDG_RUNTIME_DIR/ableton-live-<hash>) and preloads shim/libpathfix.so:
 //     Live and its indexer skip content in hidden folders, which left the
 //     browser's built-in device categories empty (shim/pathfix.c).
-//     LIVE_PATHFIX=0 turns this off.
+//     LIVE_PATHFIX=0 turns this off;
+//   - makes sure ableton: links (authorization in the browser) reach a launcher:
+//     when nothing handles them or the handler is broken, registers this one
+//     (tools/linkhandler.h; in the background, LIVE_LINK_HANDLER=0 turns it off).
 // Live asks for the loader at /lib/ld-linux-x86-64.so.2, the Push's path.
 // Arch has it; Debian, Ubuntu, Mint and Fedora only have
 // /lib64/ld-linux-x86-64.so.2, and need a link (shown in a dialog if missing).
@@ -43,10 +54,13 @@
 #define APP_NAME "AbletonLive" LIVE_MAJOR
 #define APP_TITLE "Ableton Live " LIVE_MAJOR
 
+#include "linkhandler.h"
+
 static const char kLoader[] = "/lib/ld-linux-x86-64.so.2";
 static const char kShim[] = "../../shim/libmenufix.so";
 static const char kEmu[] = "../../shim/libavx512emu.so";
 static const char kPathfix[] = "../../shim/libpathfix.so";
+static const char kPackmeta[] = "../../shim/libpackmeta.so";
 
 static void cpuid(unsigned leaf, unsigned sub, unsigned r[4])
 {
@@ -133,6 +147,19 @@ static int make_link(const char *root, char *link, size_t size)
     return symlink(root, link) == 0;
 }
 
+// The desktop's own value of name, for the programs Live opens links with
+// (shim/desktopenv.cpp): LIVE_DESKTOP_<name>, "-" when it was not set. Kept
+// when an outer launcher already recorded it.
+static void remember(const char *name)
+{
+    char key[64];
+    snprintf(key, sizeof key, "LIVE_DESKTOP_%s", name);
+    if (getenv(key))
+        return;
+    const char *value = getenv(name);
+    setenv(key, value ? value : "-", 1);
+}
+
 // name=first[:previous value]
 static void prepend(const char *name, const char *first)
 {
@@ -149,9 +176,26 @@ static void prepend(const char *name, const char *first)
     free(value);
 }
 
+// Whether the system's library folders hold name (the ones distributions use
+// for 64-bit libraries; the launcher is static, so it cannot ask the loader).
+static int system_has(const char *name)
+{
+    static const char *const dirs[] = {"/usr/lib64", "/usr/lib/x86_64-linux-gnu", "/lib/x86_64-linux-gnu",
+                                       "/usr/lib", "/lib64"};
+    char path[PATH_MAX];
+    for (size_t i = 0; i < sizeof dirs / sizeof *dirs; ++i) {
+        snprintf(path, sizeof path, "%s/%s", dirs[i], name);
+        if (access(path, R_OK) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     (void)argc;
+    remember("LD_PRELOAD");
+    remember("LD_LIBRARY_PATH");
     char app[PATH_MAX];
     const ssize_t n = readlink("/proc/self/exe", app, sizeof app - 1);
     if (n <= 0) {
@@ -159,6 +203,18 @@ int main(int argc, char **argv)
         return 1;
     }
     app[n] = '\0';
+    // The ableton: link check, detached (two forks: Live does not inherit a child to reap).
+    const pid_t checker = fork();
+    if (checker == 0) {
+        if (fork() == 0) {
+            setsid(); // a terminal that closes does not end it
+            link_check(app, LIVE_MAJOR);
+            _exit(0);
+        }
+        _exit(0);
+    }
+    if (checker > 0)
+        waitpid(checker, NULL, 0);
     *strrchr(app, '/') = '\0';
     if (chdir(app) != 0) {
         perror(APP_NAME ": chdir");
@@ -180,6 +236,14 @@ int main(int argc, char **argv)
     if (access(shim, R_OK) != 0) {
         report("The shim is missing (shim/libmenufix.so next to push3_opt/).");
         return 1;
+    }
+    // libpackmeta.so after the shim. By full path, so that the indexer, which Live
+    // may start elsewhere, finds it; relative when the path would split the list.
+    if (access(kPackmeta, R_OK) == 0) {
+        char packmeta[PATH_MAX];
+        if (!realpath(kPackmeta, packmeta) || strpbrk(packmeta, " :"))
+            snprintf(packmeta, sizeof packmeta, "%s", kPackmeta);
+        prepend("LD_PRELOAD", packmeta);
     }
     prepend("LD_PRELOAD", shim);
 
@@ -226,7 +290,21 @@ int main(int argc, char **argv)
         prepend("LD_PRELOAD", kEmu); // first, so its SIGILL handler is in place before anything runs
     }
 
-    snprintf(libs, sizeof libs, "%s/lib:%s/compat_lib", app, root);
+    // Fallback copies, each used only when the system lacks its libraries:
+    // compat_lib/<folder> holds them (install.sh, tools/bundled/README).
+    static const struct {
+        const char *folder, *libs[2];
+    } fallbacks[] = {{"openssl3", {"libssl.so.3", "libcrypto.so.3"}}, {"libxml2", {"libxml2.so.2", NULL}}};
+    int used = snprintf(libs, sizeof libs, "%s/lib:%s/compat_lib", app, root);
+    for (size_t f = 0; f < sizeof fallbacks / sizeof *fallbacks && used > 0 && (size_t)used < sizeof libs; ++f) {
+        char dir[PATH_MAX + 32];
+        snprintf(dir, sizeof dir, "%s/compat_lib/%s", root, fallbacks[f].folder);
+        int missing = 0;
+        for (int l = 0; l < 2 && fallbacks[f].libs[l]; ++l)
+            missing |= !system_has(fallbacks[f].libs[l]);
+        if (missing && access(dir, R_OK) == 0)
+            used += snprintf(libs + used, sizeof libs - (size_t)used, ":%s", dir);
+    }
     prepend("LD_LIBRARY_PATH", libs);
 
     char live[PATH_MAX + 8];
