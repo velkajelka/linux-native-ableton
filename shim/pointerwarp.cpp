@@ -65,15 +65,18 @@
 #include <QScreen>
 #include <QWindow>
 #include <X11/Xlib.h>
-#include <link.h>
-#include <xcb/xcb.h>
-#include <xcb/xinput.h>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <link.h>
+#include <xcb/xcb.h>
+#include <xcb/xinput.h>
 
 void menufixTrace(const char *fmt, int a = 0, int b = 0, int c = 0);
-bool redirectFunction(uintptr_t fn, const unsigned char *prologue, size_t len, void *target); // hook.cpp
+bool wheelSynthPointer(
+    QPoint *position); // wheelvalues.cpp: virtual pointer while a wheel drag runs
+bool redirectFunction(uintptr_t fn, const unsigned char *prologue, size_t len,
+                      void *target); // hook.cpp
 
 namespace {
 
@@ -82,177 +85,175 @@ namespace {
 // set-position 0x1b8ea70 ("x11: failed to set the mouse position"), same
 // arguments, guarded by 0x1be5e40. Its view runs at Qt's ratio too, with the
 // same jump on a scaled desktop (tempo dragged 20 px at 125 %: 120 -> 209).
-uintptr_t kGetPosition = 0x1fe4fe0; // () -> x | y << 32
-uintptr_t kSetPosition = 0x1fe4f00; // (platform *, x | y << 32)
+uintptr_t kGetPosition = 0x1fe4fe0;     // () -> x | y << 32
+uintptr_t kSetPosition = 0x1fe4f00;     // (platform *, x | y << 32)
 uintptr_t kPointerDisabled = 0x20506a0; // Live's own guard in set-position
-const unsigned char kGetPositionPrologue[] = {0x41, 0x56, 0x53, 0x48, 0x83, 0xec, 0x38,
-                                              0xc7, 0x44, 0x24, 0x0c, 0x00, 0x00, 0x00, 0x00};
+const unsigned char kGetPositionPrologue[] = {0x41, 0x56, 0x53, 0x48, 0x83, 0xec, 0x38, 0xc7,
+                                              0x44, 0x24, 0x0c, 0x00, 0x00, 0x00, 0x00};
 const unsigned char kSetPositionPrologue[] = {0x55, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
                                               0x41, 0x54, 0x53, 0x50, 0x48, 0x89, 0xf3};
-const unsigned char kGetPositionPrologue11[] = {0x41, 0x56, 0x53, 0x48, 0x83, 0xec, 0x38,
-                                                0x64, 0x48, 0x8b, 0x04, 0x25, 0x28, 0x00, 0x00};
+const unsigned char kGetPositionPrologue11[] = {0x41, 0x56, 0x53, 0x48, 0x83, 0xec, 0x38, 0x64,
+                                                0x48, 0x8b, 0x04, 0x25, 0x28, 0x00, 0x00};
 const unsigned char kSetPositionPrologue11[] = {0x55, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
                                                 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x18};
 
 uintptr_t base;
 QPointF warpError; // the last warp's exact target minus the X pixel it landed on
 
-bool traceWarps()
-{
-    static const bool trace = getenv("LIVE_WARP_TRACE") && *getenv("LIVE_WARP_TRACE") == '1';
-    return trace;
+bool traceWarps() {
+  static const bool trace = getenv("LIVE_WARP_TRACE") && *getenv("LIVE_WARP_TRACE") == '1';
+  return trace;
 }
 
-uint64_t pack(const QPoint &p)
-{
-    return uint32_t(p.x()) | uint64_t(uint32_t(p.y())) << 32;
+uint64_t pack(const QPoint &p) { return uint32_t(p.x()) | uint64_t(uint32_t(p.y())) << 32; }
+
+Display *display() {
+  static Display *dpy = XOpenDisplay(nullptr);
+  return dpy;
 }
 
-Display *display()
-{
-    static Display *dpy = XOpenDisplay(nullptr);
-    return dpy;
+uint64_t getPosition() {
+  QPoint p;
+  if (!wheelSynthPointer(&p))
+    p = QCursor::pos();
+  if (traceWarps())
+    menufixTrace("pointerwarp: get %d,%d\n", p.x(), p.y());
+  return pack(p);
 }
 
-uint64_t getPosition()
-{
-    const QPoint p = QCursor::pos();
-    if (traceWarps())
-        menufixTrace("pointerwarp: get %d,%d\n", p.x(), p.y());
-    return pack(p);
+void setPosition(void *, uint64_t packed) {
+  if (wheelSynthPointer(nullptr))
+    return; // a wheel drag: the real pointer stays put
+  if (reinterpret_cast<bool (*)()>(base + kPointerDisabled)())
+    return;
+  const QPoint p(int32_t(packed), int32_t(packed >> 32));
+  Display *dpy = display();
+  if (!dpy)
+    return;
+  // Live's points come from mapToGlobal(), which adds the window's X
+  // position and the position in it, so convert back the same way.
+  QPointF exact;
+  QWindow *window = QGuiApplication::focusWindow();
+  Window child;
+  int x, y;
+  if (window && window->handle() &&
+      XTranslateCoordinates(dpy, window->winId(), DefaultRootWindow(dpy), 0, 0, &x, &y, &child)) {
+    exact = QPointF(x, y) + QPointF(p - window->mapToGlobal(QPoint())) * window->devicePixelRatio();
+  } else {
+    QScreen *screen = QGuiApplication::screenAt(p);
+    if (!screen)
+      screen = QGuiApplication::primaryScreen();
+    if (!screen)
+      return;
+    const QPoint origin = screen->geometry().topLeft();
+    exact = origin + QPointF(p - origin) * screen->devicePixelRatio();
+  }
+  const QPoint x11 = exact.toPoint();
+  warpError = exact - x11;
+  if (traceWarps())
+    menufixTrace("pointerwarp: set %d,%d (X %d)\n", p.x(), p.y(), x11.y());
+  XWarpPointer(dpy, None, DefaultRootWindow(dpy), 0, 0, 0, 0, x11.x(), x11.y());
+  XFlush(dpy);
 }
 
-void setPosition(void *, uint64_t packed)
-{
-    if (reinterpret_cast<bool (*)()>(base + kPointerDisabled)())
-        return;
-    const QPoint p(int32_t(packed), int32_t(packed >> 32));
-    Display *dpy = display();
-    if (!dpy)
-        return;
-    // Live's points come from mapToGlobal(), which adds the window's X
-    // position and the position in it, so convert back the same way.
-    QPointF exact;
-    QWindow *window = QGuiApplication::focusWindow();
-    Window child;
-    int x, y;
-    if (window && window->handle()
-        && XTranslateCoordinates(dpy, window->winId(), DefaultRootWindow(dpy), 0, 0, &x, &y, &child)) {
-        exact = QPointF(x, y) + QPointF(p - window->mapToGlobal(QPoint())) * window->devicePixelRatio();
-    } else {
-        QScreen *screen = QGuiApplication::screenAt(p);
-        if (!screen)
-            screen = QGuiApplication::primaryScreen();
-        if (!screen)
-            return;
-        const QPoint origin = screen->geometry().topLeft();
-        exact = origin + QPointF(p - origin) * screen->devicePixelRatio();
-    }
-    const QPoint x11 = exact.toPoint();
-    warpError = exact - x11;
-    if (traceWarps())
-        menufixTrace("pointerwarp: set %d,%d (X %d)\n", p.x(), p.y(), x11.y());
-    XWarpPointer(dpy, None, DefaultRootWindow(dpy), 0, 0, 0, 0, x11.x(), x11.y());
-    XFlush(dpy);
-}
-
-int32_t roundedFp1616(int32_t value, qreal shift)
-{
-    return int32_t(std::lround(value / 65536.0 + shift)) * 65536;
+int32_t roundedFp1616(int32_t value, qreal shift) {
+  return int32_t(std::lround(value / 65536.0 + shift)) * 65536;
 }
 
 struct PositionRounder : QAbstractNativeEventFilter {
-    uint8_t xinput = 0; // XInputExtension's major opcode
+  uint8_t xinput = 0; // XInputExtension's major opcode
 
-    bool nativeEventFilter(const QByteArray &, void *message, long *) override
-    {
-        auto *generic = static_cast<xcb_ge_generic_event_t *>(message);
-        if ((generic->response_type & 0x7f) != XCB_GE_GENERIC || generic->extension != xinput)
-            return false;
-        if (generic->event_type != XCB_INPUT_MOTION && generic->event_type != XCB_INPUT_BUTTON_PRESS
-            && generic->event_type != XCB_INPUT_BUTTON_RELEASE)
-            return false;
-        if (generic->event_type == XCB_INPUT_BUTTON_PRESS)
-            warpError = {};
-        const QPointF shift = QGuiApplication::mouseButtons() ? warpError : QPointF();
-        auto *event = static_cast<xcb_input_motion_event_t *>(message);
-        const int32_t rawY = event->root_y;
-        event->root_x = roundedFp1616(event->root_x, shift.x());
-        event->root_y = roundedFp1616(event->root_y, shift.y());
-        event->event_x = roundedFp1616(event->event_x, shift.x());
-        event->event_y = roundedFp1616(event->event_y, shift.y());
-        matchGlobalPosition(event);
-        if (traceWarps())
-            menufixTrace("pointerwarp: event y %d/100 -> %d/100 (event_y %d)\n", int(rawY * 100LL / 65536),
-                         int(event->root_y * 100LL / 65536), event->event_y / 65536);
-        return false;
-    }
+  bool nativeEventFilter(const QByteArray &, void *message, long *) override {
+    auto *generic = static_cast<xcb_ge_generic_event_t *>(message);
+    if ((generic->response_type & 0x7f) != XCB_GE_GENERIC || generic->extension != xinput)
+      return false;
+    if (generic->event_type != XCB_INPUT_MOTION && generic->event_type != XCB_INPUT_BUTTON_PRESS &&
+        generic->event_type != XCB_INPUT_BUTTON_RELEASE)
+      return false;
+    if (generic->event_type == XCB_INPUT_BUTTON_PRESS)
+      warpError = {};
+    const QPointF shift = QGuiApplication::mouseButtons() ? warpError : QPointF();
+    auto *event = static_cast<xcb_input_motion_event_t *>(message);
+    const int32_t rawY = event->root_y;
+    event->root_x = roundedFp1616(event->root_x, shift.x());
+    event->root_y = roundedFp1616(event->root_y, shift.y());
+    event->event_x = roundedFp1616(event->event_x, shift.x());
+    event->event_y = roundedFp1616(event->event_y, shift.y());
+    matchGlobalPosition(event);
+    if (traceWarps())
+      menufixTrace("pointerwarp: event y %d/100 -> %d/100 (event_y %d)\n",
+                   int(rawY * 100LL / 65536), int(event->root_y * 100LL / 65536),
+                   event->event_y / 65536);
+    return false;
+  }
 
-    // Qt converts an event's root position to its units with the window's
-    // screen, rounding on its own, while mapToGlobal() adds the event's
-    // position in the window to the window's position, each rounded. At a
-    // fractional ratio the two came out a pixel apart (a window at X y 373
-    // is at 298.4), and Live, which takes its press point from mapToGlobal()
-    // and the motion from the events, read that pixel on every motion: the
-    // tempo went 120, 168, 168, 215 for 40 px up, 80 down and 40 up. The
-    // root position is set to where Qt's conversion gives mapToGlobal() of
-    // the event's position in the window.
-    static void matchGlobalPosition(xcb_input_motion_event_t *event)
-    {
-        QWindow *window = nullptr; // Live's view is a native child window
-        for (QWindow *w : QGuiApplication::allWindows())
-            if (w->handle() && xcb_window_t(w->winId()) == event->event)
-                window = w;
-        QScreen *screen = window ? window->screen() : nullptr;
-        if (!screen)
-            return;
-        const QPointF local = QPointF(event->event_x / 65536, event->event_y / 65536) / window->devicePixelRatio();
-        const QPoint global = window->mapToGlobal(local.toPoint());
-        const QPoint origin = screen->geometry().topLeft();
-        const QPointF native = origin + QPointF(global - origin) * screen->devicePixelRatio();
-        event->root_x = int32_t(std::lround(native.x() * 65536));
-        event->root_y = int32_t(std::lround(native.y() * 65536));
-    }
+  // Qt converts an event's root position to its units with the window's
+  // screen, rounding on its own, while mapToGlobal() adds the event's
+  // position in the window to the window's position, each rounded. At a
+  // fractional ratio the two came out a pixel apart (a window at X y 373
+  // is at 298.4), and Live, which takes its press point from mapToGlobal()
+  // and the motion from the events, read that pixel on every motion: the
+  // tempo went 120, 168, 168, 215 for 40 px up, 80 down and 40 up. The
+  // root position is set to where Qt's conversion gives mapToGlobal() of
+  // the event's position in the window.
+  static void matchGlobalPosition(xcb_input_motion_event_t *event) {
+    QWindow *window = nullptr; // Live's view is a native child window
+    for (QWindow *w : QGuiApplication::allWindows())
+      if (w->handle() && xcb_window_t(w->winId()) == event->event)
+        window = w;
+    QScreen *screen = window ? window->screen() : nullptr;
+    if (!screen)
+      return;
+    const QPointF local =
+        QPointF(event->event_x / 65536, event->event_y / 65536) / window->devicePixelRatio();
+    const QPoint global = window->mapToGlobal(local.toPoint());
+    const QPoint origin = screen->geometry().topLeft();
+    const QPointF native = origin + QPointF(global - origin) * screen->devicePixelRatio();
+    event->root_x = int32_t(std::lround(native.x() * 65536));
+    event->root_y = int32_t(std::lround(native.y() * 65536));
+  }
 };
 
-uintptr_t mainBase()
-{
-    uintptr_t b = 0;
-    dl_iterate_phdr(
-        [](dl_phdr_info *info, size_t, void *out) {
-            *static_cast<uintptr_t *>(out) = info->dlpi_addr; // first entry = main program
-            return 1;
-        },
-        &b);
-    return b;
+uintptr_t mainBase() {
+  uintptr_t b = 0;
+  dl_iterate_phdr(
+      [](dl_phdr_info *info, size_t, void *out) {
+        *static_cast<uintptr_t *>(out) = info->dlpi_addr; // first entry = main program
+        return 1;
+      },
+      &b);
+  return b;
 }
 
 } // namespace
 
-void installPointerWarp()
-{
-    const bool live11 = liveBuild() == LiveBuild::Live11_3_43;
-    if (!live11 && liveBuild() != LiveBuild::Live12_4_7)
-        return; // not ported to this Live build
-    base = mainBase();
-    if (live11) {
-        kGetPosition = 0x1b8eb80;
-        kSetPosition = 0x1b8ea70;
-        kPointerDisabled = 0x1be5e40;
-    }
-    const bool get = live11 ? redirectFunction(base + kGetPosition, kGetPositionPrologue11, sizeof kGetPositionPrologue11,
-                                               reinterpret_cast<void *>(&getPosition))
-                            : redirectFunction(base + kGetPosition, kGetPositionPrologue, sizeof kGetPositionPrologue,
-                                               reinterpret_cast<void *>(&getPosition));
-    const bool set = live11 ? redirectFunction(base + kSetPosition, kSetPositionPrologue11, sizeof kSetPositionPrologue11,
-                                               reinterpret_cast<void *>(&setPosition))
-                            : redirectFunction(base + kSetPosition, kSetPositionPrologue, sizeof kSetPositionPrologue,
-                                               reinterpret_cast<void *>(&setPosition));
-    static PositionRounder rounder;
-    int opcode, event, error;
-    if (display() && XQueryExtension(display(), "XInputExtension", &opcode, &event, &error)) {
-        rounder.xinput = uint8_t(opcode);
-        QCoreApplication::instance()->installNativeEventFilter(&rounder);
-    }
-    menufixTrace("pointerwarp: get %d, set %d, rounding %d\n", get, set, rounder.xinput);
+void installPointerWarp() {
+  const bool live11 = liveBuild() == LiveBuild::Live11_3_43;
+  if (!live11 && liveBuild() != LiveBuild::Live12_4_7)
+    return; // not ported to this Live build
+  base = mainBase();
+  if (live11) {
+    kGetPosition = 0x1b8eb80;
+    kSetPosition = 0x1b8ea70;
+    kPointerDisabled = 0x1be5e40;
+  }
+  const bool get =
+      live11
+          ? redirectFunction(base + kGetPosition, kGetPositionPrologue11,
+                             sizeof kGetPositionPrologue11, reinterpret_cast<void *>(&getPosition))
+          : redirectFunction(base + kGetPosition, kGetPositionPrologue, sizeof kGetPositionPrologue,
+                             reinterpret_cast<void *>(&getPosition));
+  const bool set =
+      live11
+          ? redirectFunction(base + kSetPosition, kSetPositionPrologue11,
+                             sizeof kSetPositionPrologue11, reinterpret_cast<void *>(&setPosition))
+          : redirectFunction(base + kSetPosition, kSetPositionPrologue, sizeof kSetPositionPrologue,
+                             reinterpret_cast<void *>(&setPosition));
+  static PositionRounder rounder;
+  int opcode, event, error;
+  if (display() && XQueryExtension(display(), "XInputExtension", &opcode, &event, &error)) {
+    rounder.xinput = uint8_t(opcode);
+    QCoreApplication::instance()->installNativeEventFilter(&rounder);
+  }
+  menufixTrace("pointerwarp: get %d, set %d, rounding %d\n", get, set, rounder.xinput);
 }
