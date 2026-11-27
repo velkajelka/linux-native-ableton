@@ -1,13 +1,20 @@
-# Ableton Live 12 on Linux
+# Native Ableton Live on Linux
 ![Project in Live](LiveDemo.png)
 
 <br>
 
 This project brings you the Linux build of Ableton Live 12 that ships inside the Push 3 recovery image as a normal desktop app. With some custom shims it transforms it into a fully functional Live 12, but running natively on Linux. The content the image lacks (Core Library, lessons, stem models, cursors, icon) comes from the Windows Suite installer.
 
-Ableton's files are not modified, and this repository contains none of them. A small launcher starts Live with a shim library preloaded. The shim makes Live work on the desktop: window, menus, file dialogs, plug-in editors, audio through PipeWire, and mixed-scale monitors.
+The repository contains none of Ableton's files. Live is not modified on disk; a small launcher starts Live with a shim library preloaded, and adjusts some of its functions in memory for intended behaviour.
 
-This project is not affiliated with or endorsed by Ableton. Licensing is not touched: Live starts unauthorized, and you authorize it with your own Ableton account as usual.
+Ableton Live and Push are trademarks of Ableton AG. This project is **not affiliated with, endorsed by, or supported by Ableton AG**. Licensing is not touched: Live starts unauthorized, and you authorize it with your own Ableton account as usual.
+
+<br>
+
+You can join the Discord server for discussions (our project is in channel #native)
+<br>
+
+[![Join our Discord](https://dcbadge.limes.pink/api/server/aUf46aSE39)](https://discord.gg/aUf46aSE39)
 
 <br>
 
@@ -87,17 +94,17 @@ The commands cover Live 12 and Live 11 (`cabextract` and `python3` are only for 
    unzip linux-native-ableton.zip
    cd linux-native-ableton-main
    ```
-3. You need your own copies of:
+3. You need your own copies of these:
 
-   - the Push 3 recovery image 2.4.7, available [here](https://cdn-downloads.ableton.com/hardware_updates/push3/2.4.7/Push3-RecoveryImage-2.4.7.zip)
-   - the Windows installer of Live 12.4.7 Suite, available [here](https://cdn-downloads.ableton.com/channels/12.4.7/ableton_live_suite_12.4.7_64.zip)
+   - the Push 3 recovery image 2.4.7 (Push3-RecoveryImage-2.4.7.zip)
+   - the Windows installer of Live 12.4.7 Suite (ableton_live_suite_12.4.7_64.zip)
 
    If you want to run Live 11:
 
-   - the Push 3 recovery image 1.2.23, available [here](https://cdn-downloads.ableton.com/hardware_updates/push3/1.2.23/Push3-RecoveryImage-1.2.23.zip)
-   - the Windows installer of Live 11.3.43 Suite, available [here](https://cdn-downloads.ableton.com/channels/11.3.43/ableton_live_suite_11.3.43_64.zip)
+   - the Push 3 recovery image 1.2.23 (Push3-RecoveryImage-1.2.23.zip)
+   - the Windows installer of Live 11.3.43 Suite (ableton_live_suite_11.3.43_64.zip)
 
-   You can also access them on https://www.ableton.com/en/download/archive/ (but you need an account to download it from there).
+   Access them on https://www.ableton.com/en/download/archive/, you need to have your own Ableton account and a valid license.
 4. Put both zips into the same folder, next to `install.sh`.
 5. Run `install.sh`. Double-click it (it opens a terminal window that shows the progress and stays open at the end), or run it in a terminal:
 
