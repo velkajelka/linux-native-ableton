@@ -48,6 +48,9 @@ You can join the Discord server for discussions (our project is in channel #nati
 - Max for Live device interfaces are hidden in Clip view and over a collapsed detail area, and placed and scaled correctly at desktop scales other than 100 %. `LIVE_MAX_VIEWS=0` turns this off.
 - Your own themes: put `.ask` files into `~/.local/share/Ableton/Themes/Live 12/` (Live 11: `Themes/Live 11/`) and restart Live.
 
+**Factory packs**
+- Pack contents show in the browser. A pack's `Ableton Folder Info/Metadata.cfg` stores its folders and files with Windows separators, which this Live build never matches, so every pack folder past the first level was empty. The shim rewrites those separators at start-up (`shim/packmeta.cpp`), so a pack Live installs itself is fixed on the next start. `MENUFIX_PACK_META=0` turns this off; `tools/fix-pack-paths.py` does the same for one folder by hand.
+
 **Fixes**
 - Instruments, Audio Effects, MIDI Effects, Modulators and Max for Live were empty in the browser with the default install folder (Live skips paths with a hidden folder such as `.local`).
 - Live's display stood still while a file dialog was open.

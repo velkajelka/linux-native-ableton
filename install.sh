@@ -914,6 +914,28 @@ command -v xdg-mime >/dev/null && xdg-mime default "ableton-live-$LIVE_MAJOR.des
 ok ".als and .alp files, ableton:// links"
 fi
 
+# --- pack browser metadata --------------------------------------------------------
+# A pack's Metadata.cfg stores its folders and files with Windows separators
+# ("Ableton Folder Info\Previews\Drums"); the Core Library's, and everything
+# Live writes itself, use '/'. Live looks a folder's contents up in that map, so
+# on Linux a backslashed key never matches: a pack lists its first-level folders
+# and nothing below them. tools/fix-pack-paths.py rewrites only those UTF-16
+# separators and is idempotent. The shim does the same at every start (shim/packmeta.cpp),
+# so this step only matters when that is off or the shim is not loaded.
+step "Fixing the paths inside pack browser metadata"
+PACK_ROOTS=()
+[ -d "$PREFIX/live-home/Music/Ableton/Factory Packs" ] && PACK_ROOTS+=("$PREFIX/live-home/Music/Ableton/Factory Packs")
+[ -d "$HOME/Music/Ableton/Factory Packs" ] && PACK_ROOTS+=("$HOME/Music/Ableton/Factory Packs")
+if [ ${#PACK_ROOTS[@]} = 0 ]; then
+    note "No Factory Packs folder yet. Install a pack, then run tools/fix-pack-paths.py on it."
+elif ! command -v python3 >/dev/null; then
+    note "python3 is not installed, so pack contents stay hidden. Run tools/fix-pack-paths.py on your Factory Packs folder once python3 is there."
+else
+    python3 -I "$PREFIX/tools/fix-pack-paths.py" --quiet "${PACK_ROOTS[@]}" \
+        && ok "pack folders list their contents" \
+        || note "Could not fix a pack's Metadata.cfg; run $PREFIX/tools/fix-pack-paths.py --dry-run on Factory Packs to see which."
+fi
+
 # --- program loader -----------------------------------------------------------------
 # Live asks for the loader at /lib/ld-linux-x86-64.so.2, the Push's path. Arch
 # has it; most distributions have it only at /lib64.
